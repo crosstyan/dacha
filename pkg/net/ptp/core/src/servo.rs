@@ -192,6 +192,24 @@ impl PIFilterState {
         }
     }
 
+    /// A filter that has not been fed yet, with its output at 'freq_ppm' (the frequency the
+    /// clock already runs at) and the integral that gives that output. A default filter
+    /// starts at 0 ppm, so a step-limited one (the basic client may move 0.001 ppm per update)
+    /// would first set the clock to about 0 ppm and lose the frequency it had learned.
+    pub fn starting_at(config: &TimeAdjustmentConfig, freq_ppm: f64) -> Self {
+        let integral = if config.i_scale() != 0.0 {
+            clamp_magnitude(freq_ppm / 1_000_000.0 / config.i_scale(), config.max_error_integral_secs())
+        } else {
+            0.0
+        };
+
+        Self {
+            integral,
+            last_time: None,
+            last_output: freq_ppm,
+        }
+    }
+
     /// Called while the filter is not fed (for example while its source is not
     /// trusted). Forgets the time of the last update, so that the next update
     /// does not integrate its error over the whole pause. The integral, which
@@ -438,6 +456,21 @@ mod tests {
         };
         pi.update(&config, 1e-6, start + Duration::from_millis(500));
         assert!(pi.integral > 0.0005, "integral held at {}", pi.integral);
+    }
+
+    #[test]
+    fn basic_client_starts_from_the_clock_frequency() {
+        // The leader's PTP clock runs at +15 ppm when its basic client starts (a follower
+        // promoted to leader, or a manager restart).
+        let config = default_config_template().basic_client().clock_sync().clone();
+        let mut pi = PIFilterState::starting_at(&config, 15.0);
+        let c = pi.update(&config, 0.005, Instant::now());
+
+        assert!(
+            (c.freq_ppm - 15.0).abs() <= config.max_frequency_step_ppm() + 1e-9,
+            "first output {} ppm",
+            c.freq_ppm
+        );
     }
 
     #[test]

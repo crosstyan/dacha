@@ -276,6 +276,8 @@ impl TimeSyncNode {
     }
 
     pub async fn configure(&self, config: &TimeSyncConfig) -> Result<()> {
+        let phc_freq_ppm = self.shared.ptp_device.clock().get_adjustments()?.freq() as f64 / 65536.0;
+
         lock!(state <= self.shared.state.lock().await?, {
             let old_config = std::mem::replace(&mut state.config, config.clone());
 
@@ -284,8 +286,8 @@ impl TimeSyncNode {
             }
 
             state.follower_state = reconfigure_follower(&old_config, config, state.follower_state.take());
-            state.basic_client_state =
-                reconfigure_basic_client(&old_config, config, state.basic_client_state.take());
+            state.basic_client_state = reconfigure_basic_client(
+                &old_config, config, state.basic_client_state.take(), phc_freq_ppm);
 
             Ok(())
         })
@@ -939,21 +941,36 @@ fn reconfigure_follower(
 }
 
 /// The basic client state after a reconfiguration: kept while the basic client config is
-/// unchanged, since its step-limited servo needs a long time to learn its frequency again and
-/// the leader's config changes with every camera that comes or goes.
+/// unchanged apart from its server address, since its step-limited servo needs a long time to
+/// learn its frequency again and the leader's config changes with every camera that comes or
+/// goes. The server address alone changes with every manager start (its time server binds a
+/// random port).
+///
+/// A new state starts from 'phc_freq_ppm', the frequency the PTP clock runs at now: a follower
+/// promoted to leader was locked to the old leader, and the followers keep that frequency.
 fn reconfigure_basic_client(
     old: &TimeSyncConfig,
     new: &TimeSyncConfig,
     state: Option<FollowerState>,
+    phc_freq_ppm: f64,
 ) -> Option<FollowerState> {
+    let without_server = |config: &TimeSyncConfig| {
+        let mut basic_client = config.basic_client().clone();
+        basic_client.set_server_addr("");
+        basic_client
+    };
+
     match (new.has_basic_client(), state) {
         (false, _) => None,
         (true, Some(basic_state))
-            if old.has_basic_client() && old.basic_client() == new.basic_client() =>
+            if old.has_basic_client() && without_server(old) == without_server(new) =>
         {
             Some(basic_state)
         }
-        (true, _) => Some(FollowerState::default()),
+        (true, _) => Some(FollowerState {
+            pi_filter: PIFilterState::starting_at(new.basic_client().clock_sync(), phc_freq_ppm),
+            ..Default::default()
+        }),
     }
 }
 
@@ -1057,9 +1074,23 @@ mod tests {
         // The leader's follower list changed, the basic client did not.
         let mut new = old.clone();
         new.leader_mut().new_followers().set_ptp_addr("10.0.0.3:319");
-        assert_eq!(reconfigure_basic_client(&old, &new, Some(used_state())).unwrap().num_queued_rounds, 7);
+        assert_eq!(reconfigure_basic_client(&old, &new, Some(used_state()), 0.0).unwrap().num_queued_rounds, 7);
 
-        new.basic_client_mut().set_server_addr("10.0.0.8:400");
-        assert_eq!(reconfigure_basic_client(&old, &new, Some(used_state())).unwrap().num_queued_rounds, 0);
+        // A restarted manager: same PC, its time server on a new random port.
+        new.basic_client_mut().set_server_addr("10.0.0.9:4123");
+        assert_eq!(reconfigure_basic_client(&old, &new, Some(used_state()), 0.0).unwrap().num_queued_rounds, 7);
+
+        // Other settings changed: a new state, which starts at the PTP clock's frequency.
+        new.basic_client_mut().set_sync_interval_seconds(1.0);
+        let mut state = reconfigure_basic_client(&old, &new, Some(used_state()), 15.0).unwrap();
+        assert_eq!(state.num_queued_rounds, 0);
+
+        let config = new.basic_client().clock_sync();
+        let c = state.pi_filter.update(config, 0.0, Instant::now());
+        assert!(
+            (c.freq_ppm - 15.0).abs() <= config.max_frequency_step_ppm() + 1e-9,
+            "the new basic client set the clock to {} ppm instead of keeping 15 ppm",
+            c.freq_ppm
+        );
     }
 }
