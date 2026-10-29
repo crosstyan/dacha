@@ -1030,6 +1030,25 @@ mod tests {
     }
 
     #[test]
+    fn follower_does_not_integrate_over_a_leader_change() {
+        let old = follower_of("10.0.0.1:319");
+        let new = follower_of("10.0.0.2:319");
+        let config = new.follower().leader_clock_sync().clone();
+        let error = 1e-6;
+        let start = Instant::now();
+
+        let mut state = FollowerState::default();
+        state.pi_filter.update(&config, error, start);
+        let mut state = reconfigure_follower(&old, &new, Some(state)).unwrap();
+        let c = state.pi_filter.update(&config, error, start + Duration::from_secs(100));
+
+        // The first round from the new leader adds only the proportional term. Integrating the
+        // error over the 100 s gap would add 5 ppm.
+        let expected = config.p_scale() * error * 1e6;
+        assert!((c.freq_ppm - expected).abs() < 1e-9, "{} ppm instead of {} ppm", c.freq_ppm, expected);
+    }
+
+    #[test]
     fn basic_client_keeps_its_state_while_its_config_is_unchanged() {
         let mut old = TimeSyncConfig::default();
         old.set_basic_client(ptp_core::default_config_template().basic_client().clone());
