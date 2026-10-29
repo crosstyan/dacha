@@ -47,6 +47,9 @@ pub struct PtpHealth {
     /// last status.
     pub last_leader_round: Option<Instant>,
 
+    /// Whether the camera's last status showed a leader config.
+    pub reports_leader_config: bool,
+
     /// Not chosen as the leader before this time, after it failed as one.
     pub barred_until: Option<Instant>,
 }
@@ -57,6 +60,9 @@ pub struct PtpStatusSummary {
     /// The camera reported the config the manager wants it to have.
     pub configured: bool,
 
+    /// The camera's config makes it a leader.
+    pub is_leader: bool,
+
     /// Number of followers in the camera's leader status.
     pub num_leader_followers: usize,
 
@@ -66,11 +72,12 @@ pub struct PtpStatusSummary {
 }
 
 /// Summarizes a camera's TimeSync status. 'intended' is the config the manager wants the
-/// camera to have.
-pub fn ptp_status_summary(status: &StatusResponse, intended: &TimeSyncConfig) -> PtpStatusSummary {
+/// camera to have, None while no leader is chosen.
+pub fn ptp_status_summary(status: &StatusResponse, intended: Option<&TimeSyncConfig>) -> PtpStatusSummary {
     let followers = status.leader().followers();
     PtpStatusSummary {
-        configured: status.config() == intended,
+        configured: intended.map(|c| status.config() == c).unwrap_or(false),
+        is_leader: status.config().has_leader(),
         num_leader_followers: if status.config().has_leader() { followers.len() } else { 0 },
         last_leader_round_age: followers.iter()
             .filter(|f| f.got_round())
@@ -90,6 +97,7 @@ impl PtpHealth {
             self.configured_since = None;
         }
 
+        self.reports_leader_config = status.is_leader;
         self.reports_leader_rounds = status.num_leader_followers > 0;
         self.last_leader_round = status.last_leader_round_age
             .filter(|age| age.is_finite() && *age >= 0.0)
@@ -123,10 +131,13 @@ pub struct LeaderDecision {
 
 /// Decides which camera leads.
 ///
-/// 'current' is the current leader and when it became the leader. Until
-/// 'settle_until' (a few seconds after the manager starts) a first leader is
-/// only chosen once every connected enabled camera has answered, so that the
-/// choice does not depend on which camera answered first.
+/// 'current' is the current leader and when it became the leader. With no
+/// current leader (the manager just started), a camera that already leads is
+/// adopted, the lowest such id if several do, so that a manager restart does
+/// not take the leader away. Otherwise, until 'settle_until' (a few seconds
+/// after the manager starts) a first leader is only chosen once every
+/// connected enabled camera has answered, so that the choice does not depend
+/// on which camera answered first.
 pub fn choose_ptp_leader(
     cameras: &[PtpCandidate],
     current: Option<(u64, Instant)>,
@@ -149,20 +160,24 @@ pub fn choose_ptp_leader(
     }
 
     let failed_id = failed.map(|(id, _)| id);
-    let pick = |allow_barred: bool| {
+    let pick = |allow_barred: bool, only_leading: bool| {
         cameras.iter()
             .filter(|c| c.enabled && status_fresh(c.health, now))
             .filter(|c| Some(c.camera_id) != failed_id)
             .filter(|c| allow_barred || !c.health.barred_until.map(|t| now < t).unwrap_or(false))
+            .filter(|c| !only_leading || c.health.reports_leader_config)
             .map(|c| c.camera_id)
             .min()
     };
 
-    if current.is_none()
-        && now < settle_until
-        && cameras.iter().any(|c| c.enabled && !status_fresh(c.health, now))
-    {
-        return LeaderDecision { leader: None, failed: None };
+    if current.is_none() {
+        if let Some(id) = pick(false, true) {
+            return LeaderDecision { leader: Some(id), failed: None };
+        }
+
+        if now < settle_until && cameras.iter().any(|c| c.enabled && !status_fresh(c.health, now)) {
+            return LeaderDecision { leader: None, failed: None };
+        }
     }
 
     // A leader that answers but completes no rounds may itself be fine (its followers may be
@@ -170,7 +185,7 @@ pub fn choose_ptp_leader(
     // not answer is replaced by any camera that does.
     let allow_barred = !matches!(failed, Some((_, LeaderFailure::NoRounds)));
 
-    let choice = pick(false).or_else(|| if allow_barred { pick(true) } else { None });
+    let choice = pick(false, false).or_else(|| if allow_barred { pick(true, false) } else { None });
     match choice {
         Some(id) => LeaderDecision { leader: Some(id), failed },
         // No other camera can lead: keep a failing leader rather than having none.
@@ -310,6 +325,24 @@ mod tests {
 
         // Once both answer, the lower id wins even while settling.
         w.health(3).last_status_ok = Some(w.at(1.5));
+        assert_eq!(w.choose(None, 2.0).leader, Some(3));
+    }
+
+    #[test]
+    fn running_leader_is_adopted_when_the_manager_starts() {
+        let mut w = World::new();
+        w.cam(3, Some(1.0), None).cam(7, Some(1.0), None).cam(9, None, None);
+        w.health(7).reports_leader_config = true;
+
+        // Camera 9 has not answered and camera 3 has a lower id, but camera 7 already leads.
+        assert_eq!(w.choose(None, 2.0), LeaderDecision { leader: Some(7), failed: None });
+
+        // Of several cameras that lead, the lowest id.
+        w.health(9).last_status_ok = Some(w.at(1.5));
+        w.health(9).reports_leader_config = true;
+        w.health(7).last_status_ok = Some(w.at(1.5));
+        assert_eq!(w.choose(None, 2.0).leader, Some(7));
+        w.health(3).reports_leader_config = true;
         assert_eq!(w.choose(None, 2.0).leader, Some(3));
     }
 
@@ -455,8 +488,9 @@ mod tests {
         let f = status.leader_mut().new_followers();
         f.set_last_round_age(0.1); // no completed round: the age means nothing
 
-        let summary = ptp_status_summary(&status, &intended);
+        let summary = ptp_status_summary(&status, Some(&intended));
         assert!(summary.configured);
+        assert!(summary.is_leader);
         assert_eq!(summary.num_leader_followers, 3);
         assert_eq!(summary.last_leader_round_age, Some(0.5));
 
@@ -464,9 +498,13 @@ mod tests {
         let mut follower = TimeSyncConfig::default();
         follower.set_follower(ptp_proto::ptp::FollowerConfig::default());
         status.set_config(follower);
-        let summary = ptp_status_summary(&status, &intended);
+        let summary = ptp_status_summary(&status, Some(&intended));
         assert!(!summary.configured);
+        assert!(!summary.is_leader);
         assert_eq!(summary.num_leader_followers, 0);
+
+        // With no leader chosen there is no intended config, so nothing counts as configured.
+        assert!(!ptp_status_summary(&status, None).configured);
     }
 
     #[test]

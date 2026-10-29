@@ -1265,12 +1265,14 @@ impl MocapManagerInner {
 
             lock!(state <= shared.state.lock().await?, {
                 if let Some(entry) = state.cameras.get_mut(&camera_id) {
-                    let summary = ptp_status_summary(&ptp_status, &intended_ptp_config);
+                    let summary = ptp_status_summary(&ptp_status, intended_ptp_config.as_ref());
                     entry.ptp_health.record_status(now, &summary);
                 }
             });
 
-            if *ptp_status.config() != intended_ptp_config {
+            // No PTP config is pushed while no leader is chosen: it would make every camera a
+            // follower, which demotes a leader that is still running.
+            if let Some(intended_ptp_config) = intended_ptp_config.filter(|c| ptp_status.config() != c) {
                 // eprintln!("Configuring PTP for camera...");
 
                 if intended_ptp_config.has_leader() {
@@ -1489,12 +1491,17 @@ impl MocapManagerInner {
     }
 
 
-    async fn get_ptp_config(shared: &Shared, camera_id: u64) -> Result<TimeSyncConfig> {
+    /// The TimeSync config the camera should have, or None while no leader is chosen.
+    async fn get_ptp_config(shared: &Shared, camera_id: u64) -> Result<Option<TimeSyncConfig>> {
         let config = shared.config.read().await?;
 
         lock!(state <= shared.state.lock().await?, {
             let entry = state.cameras.get(&camera_id)
                 .ok_or_else(|| err_msg("Missing camera"))?;
+
+            if state.ptp_leader.is_none() {
+                return Ok(None);
+            }
 
             let mut ptp_config = TimeSyncConfig::default();
 
@@ -1531,7 +1538,7 @@ impl MocapManagerInner {
                 }
             }
 
-            Ok(ptp_config)
+            Ok(Some(ptp_config))
         })
     }
 
