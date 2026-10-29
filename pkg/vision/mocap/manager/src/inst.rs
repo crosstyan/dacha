@@ -1265,19 +1265,8 @@ impl MocapManagerInner {
 
             lock!(state <= shared.state.lock().await?, {
                 if let Some(entry) = state.cameras.get_mut(&camera_id) {
-                    let follower_sync_age = {
-                        if ptp_status.config().has_follower() && ptp_status.follower().got_sync() {
-                            Some(ptp_status.follower().last_sync_age())
-                        } else {
-                            None
-                        }
-                    };
-
-                    entry.ptp_health.record_status(
-                        now,
-                        *ptp_status.config() == intended_ptp_config,
-                        follower_sync_age
-                    );
+                    let summary = ptp_status_summary(&ptp_status, &intended_ptp_config);
+                    entry.ptp_health.record_status(now, &summary);
                 }
             });
 
