@@ -85,6 +85,17 @@ impl ClockAdjustments {
         self.inner.freq = v;
     }
 
+    /// Microseconds added to CLOCK_REALTIME per USER_HZ tick (nominally 10000). Only
+    /// CLOCK_REALTIME has a tick; PTP clocks ignore it.
+    pub fn tick(&self) -> i64 {
+        self.inner.tick
+    }
+
+    pub fn set_tick(&mut self, v: i64) {
+        self.inner.modes |= bindings::ADJ_TICK;
+        self.inner.tick = v;
+    }
+
 }
 
 mod raw {

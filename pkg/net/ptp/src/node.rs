@@ -28,6 +28,12 @@ const SYSTEM_CLOCK_INTERVAL: Duration = Duration::from_secs(1);
 /// was preempted between the reads) is not used. On an RV1126B the reads take 1-2 us.
 const MAX_SYSTEM_CLOCK_READ_DELAY: Duration = Duration::from_micros(100);
 
+/// CLOCK_REALTIME advances by tick us per USER_HZ tick; USER_HZ is 100 on arm, arm64 and x86,
+/// so the nominal tick is 10000. linuxptp (ptp4l -S, phc2sys) moves large corrections into the
+/// tick and leaves them there when it exits: 9997 (-300 ppm) was left on a camera. The
+/// frequency set here is only correct on top of the nominal tick, so it is set with it.
+const NOMINAL_TICK_USEC: i64 = 10_000;
+
 
 
 pub struct TimeSyncNode {
@@ -502,6 +508,7 @@ impl TimeSyncNode {
         }
 
         let mut adj = sys::ClockId::REALTIME.get_adjustments()?;
+        adj.set_tick(NOMINAL_TICK_USEC);
         adj.set_freq((correction.freq_ppm * ((1 << 16) as f64)).round() as i64);
         sys::ClockId::REALTIME.set_adjustments(&adj)?;
 
