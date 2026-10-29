@@ -210,6 +210,11 @@ impl PIFilterState {
         }
     }
 
+    /// The accumulated error in seconds (the integral term before it is scaled by i_scale).
+    pub fn integral_secs(&self) -> f64 {
+        self.integral
+    }
+
     /// Called while the filter is not fed (for example while its source is not
     /// trusted). Forgets the time of the last update, so that the next update
     /// does not integrate its error over the whole pause. The integral, which

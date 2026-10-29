@@ -968,7 +968,9 @@ impl TimeSyncNode {
 /// minimum RTT, its last sync) is dropped.
 ///
 /// A new state starts from 'phc_freq_ppm', the frequency the PTP clock runs at now: a leader
-/// demoted to follower already runs at about the rate of the group.
+/// demoted to follower already runs at about the rate of the group. It is limited to the
+/// follower's max_correction_ppm, since the follower applies its first output at once and a
+/// frequency beyond that (left by another program) is no estimate of the group's rate.
 fn reconfigure_follower(
     old: &TimeSyncConfig,
     new: &TimeSyncConfig,
@@ -985,10 +987,14 @@ fn reconfigure_follower(
             }
             Some(follower_state)
         }
-        (true, _) => Some(FollowerState {
-            pi_filter: PIFilterState::starting_at(new.follower().leader_clock_sync(), phc_freq_ppm),
-            ..Default::default()
-        }),
+        (true, _) => {
+            let config = new.follower().leader_clock_sync();
+            let freq_ppm = ptp_core::clamp_magnitude(phc_freq_ppm, config.max_correction_ppm());
+            Some(FollowerState {
+                pi_filter: PIFilterState::starting_at(config, freq_ppm),
+                ..Default::default()
+            })
+        }
     }
 }
 
@@ -1110,6 +1116,18 @@ mod tests {
         let mut state = reconfigure_follower(&leader, &new, None, 15.0).unwrap();
         let c = state.pi_filter.update(&config, 0.0, Instant::now());
         assert!((c.freq_ppm - 15.0).abs() < 1e-6, "first output {} ppm instead of 15 ppm", c.freq_ppm);
+
+        // A frequency beyond the follower's limit is not taken as the group's rate.
+        let mut state = reconfigure_follower(&leader, &new, None, 150.0).unwrap();
+        let c = state.pi_filter.update(&config, 0.0, Instant::now());
+        assert!(
+            c.freq_ppm.abs() <= config.max_correction_ppm(),
+            "first output {} ppm beyond the {} ppm limit",
+            c.freq_ppm,
+            config.max_correction_ppm()
+        );
+        let integral_ppm = config.i_scale() * state.pi_filter.integral_secs() * 1e6;
+        assert!(integral_ppm <= config.max_correction_ppm() + 1e-9, "integral worth {} ppm", integral_ppm);
     }
 
     #[test]
