@@ -10,7 +10,8 @@
 // The leader is judged by its own rounds (its status per follower), not by
 // whether the followers used them: a round that a follower skipped as queued
 // still shows that the leader works, and one broken follower must not make
-// the leader change again and again.
+// the leader change again and again. With a single follower the rounds do not
+// show which camera is at fault, so such a leader is judged by Status only.
 
 use std::time::{Duration, Instant};
 
@@ -31,6 +32,11 @@ pub const ROUND_TIMEOUT: Duration = Duration::from_secs(10);
 /// A replaced leader is not chosen again for this long, unless no other
 /// camera can lead.
 pub const FAILED_LEADER_BAR: Duration = Duration::from_secs(60);
+
+/// A leader is judged by its rounds only when at least this many followers
+/// are ready (enabled, answering, configured for ROUND_TIMEOUT). With fewer it
+/// is judged by its Status RPC only.
+pub const MIN_FOLLOWERS_TO_JUDGE_ROUNDS: usize = 2;
 
 /// What the manager has seen of one camera's time sync.
 #[derive(Default, Clone, Debug)]
@@ -218,21 +224,26 @@ fn leader_failure(
         return None;
     }
 
-    // The leader must have had its config, and at least one answering follower its config,
-    // for ROUND_TIMEOUT since this camera became the leader.
+    // The leader must have had its config, and its followers theirs, for ROUND_TIMEOUT since
+    // this camera became the leader.
     let leader_configured = match leader.health.configured_since {
         Some(t) => t.max(since),
         None => return None,
     };
-    let has_ready_follower = cameras.iter()
+    let num_ready_followers = cameras.iter()
         .filter(|c| c.camera_id != leader.camera_id && c.enabled && status_fresh(c.health, now))
-        .any(|c| {
+        .filter(|c| {
             c.health.configured_since
                 .map(|t| now.saturating_duration_since(t.max(leader_configured)) > ROUND_TIMEOUT)
                 .unwrap_or(false)
-        });
+        })
+        .count();
 
-    if !has_ready_follower {
+    // With a single follower a missing round may be either camera's fault, and the next
+    // leader would fail the same way: two cameras, one broken, would swap the leader every
+    // FAILED_LEADER_BAR. Only a leader that has no round with any of two or more followers
+    // is taken to be the broken one.
+    if num_ready_followers < MIN_FOLLOWERS_TO_JUDGE_ROUNDS {
         return None;
     }
 
@@ -395,18 +406,20 @@ mod tests {
     }
 
     #[test]
-    fn leader_gets_10s_after_it_and_a_follower_are_configured() {
+    fn leader_gets_10s_after_it_and_its_followers_are_configured() {
         let mut w = World::new();
         w.cam(3, Some(99.0), Some(10.0))
             .cam(7, Some(99.0), Some(10.0))
-            .cam(9, Some(99.0), Some(95.0))
+            .cam(9, Some(99.0), Some(10.0))
+            .cam(11, Some(99.0), Some(95.0))
             .rounds(3, None);
 
         // Leader since 92 s: the followers have had 8 s with it at most.
         assert_eq!(w.choose(Some((3, 92.0)), 100.0).leader, Some(3));
 
-        // Leader since 50 s, but camera 7's status is stale and camera 9 was configured
-        // 5 s ago: no follower that could have had a round.
+        // Leader since 50 s, but camera 7's status is stale and camera 11 was configured
+        // 5 s ago: only camera 9 could have had a round, and one follower is not enough to
+        // judge the leader.
         w.health(7).last_status_ok = Some(w.at(90.0));
         assert_eq!(w.choose(Some((3, 50.0)), 100.0).leader, Some(3));
 
@@ -419,11 +432,15 @@ mod tests {
     #[test]
     fn leader_without_rounds_is_not_replaced_by_a_barred_camera() {
         let mut w = World::new();
-        w.cam(3, Some(99.0), Some(10.0)).cam(7, Some(99.0), Some(10.0)).rounds(3, None);
+        w.cam(3, Some(99.0), Some(10.0))
+            .cam(7, Some(99.0), Some(10.0))
+            .cam(9, Some(99.0), Some(10.0))
+            .rounds(3, None);
         w.health(7).barred_until = Some(w.at(120.0));
+        w.health(9).barred_until = Some(w.at(120.0));
 
-        // Camera 7 failed as a leader recently, so it does not replace a leader that still
-        // answers: the fault may be on the followers' side.
+        // Cameras 7 and 9 failed as leaders recently, so they do not replace a leader that
+        // still answers: the fault may be on the followers' side.
         assert_eq!(w.choose(Some((3, 10.0)), 100.0), LeaderDecision { leader: Some(3), failed: None });
 
         // A leader that does not answer is replaced even by a barred camera.
@@ -432,6 +449,58 @@ mod tests {
             w.choose(Some((3, 10.0)), 100.0),
             LeaderDecision { leader: Some(7), failed: Some((3, LeaderFailure::StatusFailing)) }
         );
+    }
+
+    /// Runs the leader thread's loop (one decision a second, a bar for a failed leader, every
+    /// camera reconfigured a second after a leader change) for 'seconds' with all cameras
+    /// answering. 'rounds_ok(leader)' tells whether that leader completes rounds. Returns the
+    /// number of leader changes after the first choice.
+    fn simulate_leader_thread(ids: &[u64], seconds: u64, rounds_ok: impl Fn(u64) -> bool) -> usize {
+        let mut w = World::new();
+        for id in ids {
+            w.cam(*id, Some(0.0), None);
+        }
+
+        let mut current: Option<(u64, f64)> = None;
+        let mut changes = 0;
+        for t in 1..=seconds {
+            let t = t as f64;
+            let answered = w.at(t - 0.5);
+            for id in ids {
+                let leads = current.map(|(l, _)| l) == Some(*id);
+                let h = w.health(*id);
+                h.last_status_ok = Some(answered);
+                h.reports_leader_rounds = leads;
+                h.last_leader_round = if leads && rounds_ok(*id) { Some(answered) } else { None };
+            }
+
+            let decision = w.choose(current, t);
+            if let Some((id, _)) = decision.failed {
+                w.health(id).barred_until = Some(w.at(t) + FAILED_LEADER_BAR);
+            }
+            if decision.leader != current.map(|(id, _)| id) {
+                if current.is_some() {
+                    changes += 1;
+                }
+                current = decision.leader.map(|id| (id, t));
+                for id in ids {
+                    w.health(*id).configured_since = Some(w.at(t + 1.0));
+                }
+            }
+        }
+
+        changes
+    }
+
+    #[test]
+    fn two_cameras_with_one_broken_keep_their_leader() {
+        // Camera 7 is broken: no rounds complete with it, whichever of the two leads.
+        let changes = simulate_leader_thread(&[3, 7], 600, |_| false);
+        assert!(changes <= 1, "{} leader changes in 600 s", changes);
+
+        // With three cameras a leader without rounds is still replaced, once.
+        let changes = simulate_leader_thread(&[3, 7, 9], 600, |leader| leader != 3);
+        assert_eq!(changes, 1);
     }
 
     #[test]
