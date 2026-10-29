@@ -136,8 +136,13 @@ impl PIFilterState {
         // not keep growing toward that limit. Otherwise it grows for the whole
         // of a long slew and then drives the clock far past zero (from a 3 ms
         // offset on an RV1126B: a +2 ms overshoot and about 140 s to settle).
+        //
+        // The limit holds the output in the direction of (wanted - out). With
+        // only the magnitude clamp that is the sign of 'wanted', but the
+        // frequency step limiter can hold a falling output above a positive
+        // 'wanted'.
         let held_back = (out - wanted).abs() > 1e-9;
-        let integral_grows_toward_limit = (integral - self.integral) * wanted > 0.0;
+        let integral_grows_toward_limit = (integral - self.integral) * (wanted - out) > 0.0;
         let out = if held_back && integral_grows_toward_limit {
             self.limit_ppm(config, Self::output_ppm(config, error, self.integral))
         } else {
@@ -333,6 +338,35 @@ mod tests {
         let errors = simulate(config.follower().leader_clock_sync(), 0.5, 15.0, 60.0);
         assert!(errors[0].abs() < 1e-3);
         assert!(errors.last().unwrap().abs() < 100e-9);
+    }
+
+    #[test]
+    fn integral_does_not_wind_away_from_a_step_limited_output() {
+        // The basic client's settings: the output may move by only 0.001 ppm per update.
+        let config = default_config_template().basic_client().clock_sync().clone();
+        let start = Instant::now();
+
+        // The output is at 30 ppm and wants to fall to about 24.5 ppm, but the step
+        // limiter holds it near 30 ppm. A negative error would move the integral down,
+        // further from the held output: that is windup and must not happen.
+        let mut pi = PIFilterState {
+            integral: 0.0005,
+            last_time: Some(start),
+            last_output: 30.0,
+        };
+        let c = pi.update(&config, -1e-6, start + Duration::from_millis(500));
+
+        assert!((c.freq_ppm - 29.999).abs() < 1e-9, "output {} ppm", c.freq_ppm);
+        assert_eq!(pi.integral, 0.0005, "integral wound from 0.0005 to {}", pi.integral);
+
+        // A positive error moves the integral up, toward the held output: allowed.
+        let mut pi = PIFilterState {
+            integral: 0.0005,
+            last_time: Some(start),
+            last_output: 30.0,
+        };
+        pi.update(&config, 1e-6, start + Duration::from_millis(500));
+        assert!(pi.integral > 0.0005, "integral held at {}", pi.integral);
     }
 
     #[test]
