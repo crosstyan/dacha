@@ -321,17 +321,9 @@ impl TimeSyncNode {
                 return Err(err_msg("Local TX / remote RX mismatch"));
             }
 
-            let remote_time_elapsed = remote_point.rx_time() - remote_point.tx_time();
-            let local_time_elapsed = local_tx.tx_time - local_rx.rx_time;
-
-            let rtt = {
-                if remote_time_elapsed >= local_time_elapsed {
-                    remote_time_elapsed - local_time_elapsed
-                } else {
-                    eprintln!("Near zero PTP RTT!");
-                    0
-                }
-            };
+            let rtt = ptp_core::round_trip_time(
+                remote_point.tx_time(), remote_point.rx_time(), local_rx.rx_time, local_tx.tx_time
+            ).ok_or_else(|| err_msg("Negative PTP RTT: a clock was stepped during the round"))?;
 
             let follower_config = state.config.follower();
             let verdict = follower_state.rtt_filter

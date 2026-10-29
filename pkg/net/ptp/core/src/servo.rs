@@ -6,6 +6,19 @@ use std::time::Instant;
 
 use ptp_proto::ptp::{FollowerConfig, TimeAdjustmentConfig};
 
+/// Round trip time in nanoseconds of one sync round. The leader sent its packet at
+/// 'remote_tx' and got the reply at 'remote_rx' (leader clock); the follower got the
+/// packet at 'local_rx' and sent the reply at 'local_tx' (follower clock).
+///
+/// None if an interval or the RTT is negative: a clock was stepped during the round,
+/// so the round says nothing about the offset. (It used to become an RTT of 0, which
+/// was accepted and then made the minimum RTT 0 for the whole window.)
+pub fn round_trip_time(remote_tx: u64, remote_rx: u64, local_rx: u64, local_tx: u64) -> Option<u64> {
+    let remote_elapsed = remote_rx.checked_sub(remote_tx)?;
+    let local_elapsed = local_tx.checked_sub(local_rx)?;
+    remote_elapsed.checked_sub(local_elapsed)
+}
+
 /// Tracks the smallest round trip time seen over the last few sync rounds.
 ///
 /// Through a switch that does not take part in PTP, a sync packet that waits
@@ -220,6 +233,19 @@ mod tests {
             .filter(|(rtt, _)| filter.check(follower, *rtt) == RttVerdict::Usable)
             .map(|(_, err)| *err)
             .collect()
+    }
+
+    #[test]
+    fn round_trip_time_rejects_rounds_with_a_clock_step() {
+        // Leader: sent at 1000, reply at 30000. Follower: got it at 5_000_000, replied 2 us later.
+        assert_eq!(round_trip_time(1_000, 30_000, 5_000_000, 5_002_000), Some(27_000));
+
+        // The follower's turnaround looks longer than the whole round: a clock stepped.
+        assert_eq!(round_trip_time(1_000, 30_000, 5_000_000, 5_040_000), None);
+        // The follower's clock went back between its receive and its reply.
+        assert_eq!(round_trip_time(1_000, 30_000, 5_000_000, 4_990_000), None);
+        // The leader's clock went back during the round.
+        assert_eq!(round_trip_time(30_000, 1_000, 5_000_000, 5_002_000), None);
     }
 
     #[test]
