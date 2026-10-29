@@ -11,7 +11,9 @@ impl std::fmt::Display for Errno {
             }
         }
 
-        write!(f, "{:?}", self)
+        // Not "{:?}": Debug calls this function, so an errno without a name recursed until the
+        // stack overflowed.
+        write!(f, "Errno({})", self.0)
     }
 }
 
@@ -186,3 +188,17 @@ errno_values!(
     ERFKILL, "Operation not possible due to RF-kill";
     EHWPOISON, "Memory page has hardware error";
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn errno_without_a_name_can_be_printed() {
+        // clock_adjtime used to turn its TIME_ERROR state (5) into Errno(-5), and printing that
+        // overflowed the stack.
+        assert_eq!(format!("{}", Errno(-5)), "Errno(-5)");
+        assert_eq!(format!("{:?}", Errno(100000)), "Errno(100000)");
+        assert!(format!("{}", Errno::EINVAL).starts_with("[EINVAL]"));
+    }
+}

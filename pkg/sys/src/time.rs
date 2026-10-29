@@ -43,8 +43,10 @@ impl ClockId {
     pub fn set_adjustments(&self, v: &ClockAdjustments) -> Result<(), Errno> {
         let mut buf = v.inner.clone();
         unsafe {
-            raw::clock_adjtime(self.0, &mut buf)
+            raw::clock_adjtime(self.0, &mut buf)?;
         }
+
+        Ok(())
     }
 
     pub fn set_offset_secs_f64(&self, offset: f64) -> Result<(), Errno> {
@@ -63,8 +65,10 @@ impl ClockId {
         adj.time.tv_usec = nsec as _;
 
         unsafe {
-            raw::clock_adjtime(self.0, &mut adj)
+            raw::clock_adjtime(self.0, &mut adj)?;
         }
+
+        Ok(())
     }
 }
 
@@ -106,11 +110,13 @@ mod raw {
 
     syscall!(clock_settime, bindings::SYS_clock_settime, clockid: bindings::clockid_t, tp: *const kernel::timespec => Result<()>);
 
+    // On success this returns the clock state, not 0: for CLOCK_REALTIME it is TIME_ERROR (5)
+    // while the kernel's STA_UNSYNC is set, which is the normal state with no NTP daemon.
     syscall!(
         clock_adjtime,
         bindings::SYS_clock_adjtime,
         clockid: bindings::clockid_t,
-        timex: *mut bindings::__kernel_timex => Result<()>
+        timex: *mut bindings::__kernel_timex => Result<i32>
     );
 }
 
