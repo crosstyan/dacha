@@ -1,6 +1,27 @@
 # PTP (Precision Time Protocol) Support Library
 
 
+## Upgrading: cameras before the manager
+
+The manager builds every camera's TimeSyncConfig from its own copy of
+`ptp_core::default_config_template()`, so the follower settings a camera runs
+with come from the manager, while the code that reads them is the camera's.
+
+Upgrade the cameras first:
+
+- A new camera with an old manager behaves like an old camera: the old
+  template has no `max_rtt_above_min`, `rtt_min_window` or `leader_ptp_addr`, so
+  the minimum-RTT filter and the leader check are off, and the old 10 us
+  `max_network_rtt` applies (which rejects every round on 100 Mbit/s links).
+- An old camera with a new manager is not safe. The new template sets
+  `max_network_rtt` to 1 ms, a ceiling meant for faults only, and relies on the
+  minimum-RTT filter to drop rounds that queued at a switch. An old camera has
+  no such filter, so it would use rounds up to 1 ms long, whose error can be up
+  to about 0.5 ms. It ignores `leader_ptp_addr` and lists no followers in its
+  status, which is harmless: the manager then judges such a leader by its
+  Status RPC only.
+
+
 ## Unsorted Notes
 
 
