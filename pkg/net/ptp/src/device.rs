@@ -60,9 +60,13 @@ impl PTPDevice {
         data.n_samples = 3;
         data.clockid = other_clock_id.0;
 
-        unsafe {
-            crate::ioctl::ptp_sys_offset_extended2(self.fd.as_raw_fd(), &mut data)
-        }?;
+        match unsafe { crate::ioctl::ptp_sys_offset_extended2(self.fd.as_raw_fd(), &mut data) } {
+            Ok(_) => {}
+            // Drivers without gettimex64 do not support this ioctl, among them stmmac (the
+            // RV1126B's ethernet). Read the clocks in turn instead.
+            Err(sys::Errno::EOPNOTSUPP) => return self.offset_by_reads(other_clock_id),
+            Err(e) => return Err(e.into()),
+        }
 
         let mut best_offset = PTPClockOffset {
             ptp_time: Duration::ZERO,
@@ -74,7 +78,8 @@ impl PTPDevice {
             let other_time = to_dur(&data.ts[i][0]);
             let ptp_time = to_dur(&data.ts[i][1]);
             let other_time2 = to_dur(&data.ts[i][2]);
-            let rtt = other_time2 - other_time;
+            let rtt = other_time2.checked_sub(other_time)
+                .ok_or_else(|| err_msg("The other clock went backwards while reading the PTP clock"))?;
 
             if i == 0 || rtt < best_offset.rtt {
                 best_offset = PTPClockOffset {
@@ -91,6 +96,13 @@ impl PTPDevice {
     /// For older kernels that don't have 'ptp_sys_offset_extended2'
     #[cfg(not(target_arch = "aarch64"))]
     pub fn offset_to(&self, other_clock_id: sys::ClockId) -> Result<PTPClockOffset> {
+        self.offset_by_reads(other_clock_id)
+    }
+
+    /// Reads the other clock before and after the PTP clock, three times, and keeps the
+    /// tightest of the three. Works with every driver, but the reads are separate syscalls, so
+    /// the window is wider than with 'ptp_sys_offset_extended2'.
+    pub fn offset_by_reads(&self, other_clock_id: sys::ClockId) -> Result<PTPClockOffset> {
         let mut best_offset = PTPClockOffset {
             ptp_time: Duration::ZERO,
             other_time: Duration::ZERO,
@@ -101,7 +113,8 @@ impl PTPDevice {
             let other_time = other_clock_id.get_time()?.into();
             let ptp_time = self.get_time()?.into();
             let other_time2: Duration = other_clock_id.get_time()?.into();
-            let rtt = other_time2 - other_time;
+            let rtt = other_time2.checked_sub(other_time)
+                .ok_or_else(|| err_msg("The other clock went backwards while reading the PTP clock"))?;
 
             if i == 0 || rtt < best_offset.rtt {
                 best_offset = PTPClockOffset {
