@@ -13,7 +13,7 @@ use cluster_client::{ClusterMetaClient, ServiceResolver};
 use protobuf::Message;
 use http::Resolver;
 use executor::sync::AsyncVariable;
-use ptp_core::BasicTimeNode;
+use ptp_core::{BasicTimeNode, MinRttFilter, PIFilterState, RttVerdict};
 
 use crate::signed_duration::*;
 use crate::socket::*;
@@ -55,6 +55,8 @@ struct State {
 struct FollowerState {
     pi_filter: PIFilterState,
     last_sync: Option<LastSyncMetadata>,
+    rtt_filter: Option<MinRttFilter>,
+    num_queued_rounds: u64,
 }
 
 struct LastSyncMetadata {
@@ -86,13 +88,6 @@ struct LeaderState {
 #[derive(Default)]
 struct BasicClientState {
     last_round: Option<Instant>,
-}
-
-#[derive(Default)]
-struct PIFilterState {
-    integral: f64,
-    last_time: Option<Instant>,
-    last_output: f64
 }
 
 struct LeaderPeer {
@@ -153,6 +148,11 @@ impl TimeSyncNode {
                     proto.set_last_leader_rtt(last_sync.rtt);
                     proto.set_last_sync_age((Instant::now() - last_sync.time).as_secs_f64());
                 }
+
+                if let Some(min_rtt) = follower_state.rtt_filter.as_ref().and_then(|f| f.min()) {
+                    proto.set_min_rtt(min_rtt as f64 * 1e-9);
+                }
+                proto.set_num_queued_rounds(follower_state.num_queued_rounds);
             }
 
             // TODO: Dedup this with above.
@@ -226,10 +226,25 @@ impl TimeSyncNode {
                 }
             };
 
+            let follower_config = state.config.follower();
+            let verdict = follower_state.rtt_filter
+                .get_or_insert_with(|| MinRttFilter::new(follower_config.rtt_min_window() as usize))
+                .check(follower_config, rtt);
+
             let rtt = Duration::from_nanos(rtt);
 
-            if rtt > Duration::from_secs_f32(state.config.follower().max_network_rtt()) {
-                return Err(format_err!("Sync RTT is too long: {:?}", rtt));
+            match verdict {
+                RttVerdict::Usable => {}
+                RttVerdict::TooLong => {
+                    return Err(format_err!("Sync RTT is too long: {:?}", rtt));
+                }
+                RttVerdict::Queued => {
+                    // The packets waited in a queue somewhere on the path. This is normal
+                    // through a switch that carries other traffic, so the round is only
+                    // counted.
+                    follower_state.num_queued_rounds += 1;
+                    return Ok(());
+                }
             }
 
             let mut local_time = Duration::from_nanos(local_rx.rx_time);
@@ -416,46 +431,20 @@ impl TimeSyncNode {
     fn run_time_adjustment(
         shared: &Shared,
         remote_time: Duration,
-        mut error: f64,
+        error: f64,
         config: &TimeAdjustmentConfig,
         state: &mut PIFilterState,
     ) -> Result<()> {
-        if error.abs() > config.max_offset_seconds() {
-            shared.ptp_device.clock().set_offset_secs_f64(error)?;
+        let correction = state.update(config, error, Instant::now());
+
+        if let Some(step) = correction.step_seconds {
+            shared.ptp_device.clock().set_offset_secs_f64(step)?;
             // println!("=> time shifted!");
-
-            *state = PIFilterState::default();
-            error = 0.0;
         }
 
-        let now = Instant::now();
-        if let Some(last_time) = &state.last_time {
-            // TODO: Disallow large jumps between syncs.
+        // println!("=> freq: {:.2}ppm", correction.freq_ppm);
 
-            let dt = (now - *last_time).as_secs_f64();
-            state.integral += dt * error;
-            state.integral = clamp_magnitude(state.integral, config.max_error_integral_secs());
-        }
-        state.last_time = Some(now);
-
-        let mut out = config.p_scale() * error +
-            config.i_scale() * state.integral;
-        out *= 1_000_000.0; // scale to ppm.
-
-        out = clamp_magnitude(out, config.max_correction_ppm());
-
-        if config.max_frequency_step_ppm() != 0.0 {
-            let max_step = config.max_frequency_step_ppm();
-            if (out - state.last_output).abs() > max_step {
-                out = (out - state.last_output).signum() * max_step + state.last_output;
-            }
-        }
-
-        state.last_output = out;
-
-        // println!("=> freq: {:.2}ppm", out);
-
-        out *= (1 << 16) as f64;
+        let out = correction.freq_ppm * ((1 << 16) as f64);
 
         let mut adj = shared.ptp_device.clock().get_adjustments()?;
         adj.set_freq(out.round() as i64);
@@ -730,18 +719,4 @@ impl TimeSyncService for TimeSyncNode {
         self.sync(&request.value).await?;
         Ok(())
     }
-}
-
-
-fn clamp_magnitude(mut v: f64, max: f64) -> f64 {
-    let max_p = max.abs();
-    let max_n = -max_p;
-    if v > max_p {
-        v = max_p;
-    }
-    if v < max_n {
-        v = max_n;
-    }
-
-    v
 }

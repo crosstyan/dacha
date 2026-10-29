@@ -23,8 +23,16 @@ const DEFAULT_CONFIG_TEMPLATE_PROTO: &'static str = r#"
             # Must be larger than the leader -> ntp one
             max_correction_ppm: 100
         }
-        max_network_rtt: 0.00001 # 10us
+        # A ceiling only: the RTT with no queueing depends on the link speed and the
+        # switches (28 us between two 100 Mbit/s cameras on one switch).
+        # 'max_rtt_above_min' does the filtering.
+        max_network_rtt: 0.0001 # 100us
         max_sample_age: 0.1
+
+        # Recorded on two 100 Mbit/s cameras with 20 Mbit/s of other traffic: 0.5 us kept
+        # 83% of the rounds with a worst error of 92 ns; 2 us let rounds with 0.8 us through.
+        max_rtt_above_min: 0.0000005 # 0.5us
+        rtt_min_window: 64 # 16 s of rounds
     }
 
     basic_client {

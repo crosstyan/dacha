@@ -66,6 +66,13 @@ message FollowerConfig {
     float max_network_rtt = 2;
 
     float max_sample_age = 3;
+
+    // Rounds whose RTT is more than this many seconds above the smallest RTT of the last
+    // 'rtt_min_window' rounds are skipped: their packets waited in a queue on the way, which
+    // moves the measured offset by up to half the wait. 0 turns this off.
+    float max_rtt_above_min = 4;
+
+    uint32 rtt_min_window = 5;
 }
 
 message TimeSyncPeerAddr {
@@ -127,6 +134,12 @@ message FollowerStatus {
 
     // Number of seconds since the last successful sync of the follower's time to the leader.
     double last_sync_age = 4;
+
+    // Smallest RTT in seconds over the recent rounds (see FollowerConfig.rtt_min_window).
+    double min_rtt = 5;
+
+    // Number of rounds skipped because their RTT was too far above min_rtt.
+    uint64 num_queued_rounds = 6;
 }
 
 message ConfigureRequest {
