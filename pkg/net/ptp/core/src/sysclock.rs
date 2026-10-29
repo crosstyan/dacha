@@ -107,7 +107,13 @@ mod tests {
         assert_eq!(phc_trust(&leader(true, Some(0.5)), DEFAULT_MAX_SYNC_AGE), PhcTrust::Trusted);
         assert_ne!(phc_trust(&leader(true, Some(6.0)), DEFAULT_MAX_SYNC_AGE), PhcTrust::Trusted);
         assert_ne!(phc_trust(&leader(true, None), DEFAULT_MAX_SYNC_AGE), PhcTrust::Trusted);
-        assert_ne!(phc_trust(&leader(false, None), DEFAULT_MAX_SYNC_AGE), PhcTrust::Trusted);
+    }
+
+    #[test]
+    fn leader_without_a_time_server_is_not_trusted() {
+        // A recent sync age must not matter here: without a basic client the leader's PTP
+        // clock follows nothing.
+        assert_ne!(phc_trust(&leader(false, Some(0.5)), DEFAULT_MAX_SYNC_AGE), PhcTrust::Trusted);
     }
 
     #[test]
