@@ -11,6 +11,10 @@ rust_binary(
 )
 
 rust_binary(
+    name = "ptp_status"
+)
+
+rust_binary(
     name = "ptp_enable_timestamping"
 )
 rust_binary(

@@ -123,6 +123,33 @@ message StatusResponse {
 
     // Present while TimeSyncNode::set_system_clock_sync() is enabled on this node.
     SystemClockStatus system_clock = 4;
+
+    // Present while this node is a leader.
+    LeaderStatus leader = 5;
+}
+
+message LeaderStatus {
+    repeated LeaderFollowerStatus followers = 1;
+}
+
+// The leader's view of one follower.
+message LeaderFollowerStatus {
+    string rpc_addr = 1;
+    string ptp_addr = 2;
+
+    // True once a round with this follower completed: the follower answered the PTP packet and
+    // accepted the Sync RPC. A round the follower skipped as queued also counts.
+    bool got_round = 3;
+
+    // Seconds since the last completed round.
+    double last_round_age = 4;
+
+    // Failed rounds in total, and since the last completed round.
+    uint64 num_failures = 5;
+    uint64 num_consecutive_failures = 6;
+
+    // Error of the last failed round.
+    string last_error = 7;
 }
 
 // Steering of this node's system clock (CLOCK_REALTIME) to its PTP clock, the job phc2sys does

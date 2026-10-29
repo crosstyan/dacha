@@ -57,6 +57,9 @@ struct State {
     /// of the TimeSyncConfig set over RPC.
     system_clock: Option<SystemClockState>,
 
+    /// Leader only: the followers and how the rounds with them went, as of the last round.
+    leader_peers: Vec<(TimeSyncPeerAddr, LeaderPeerHealth)>,
+
     // TODO: Probably keep one record per peer address so that we gracefully support leadership changes.
     last_rx: Option<ReceivedPacket>,
     last_tx: Option<SentPacket>,
@@ -117,8 +120,17 @@ struct BasicClientState {
     last_round: Option<Instant>,
 }
 
+#[derive(Default, Clone)]
+struct LeaderPeerHealth {
+    last_round: Option<Instant>,
+    num_failures: u64,
+    num_consecutive_failures: u64,
+    last_error: String,
+}
+
 struct LeaderPeer {
     proto: TimeSyncPeerAddr,
+    health: LeaderPeerHealth,
     configured: bool,
     rpc: Arc<TimeSyncStub>,
     ptp_addr: net::ip::SocketAddr,
@@ -200,6 +212,23 @@ impl TimeSyncNode {
                 }
             }
 
+            if state.config.has_leader() {
+                let proto = out.leader_mut();
+                let now = Instant::now();
+                for (addr, health) in &state.leader_peers {
+                    let f = proto.new_followers();
+                    f.set_rpc_addr(addr.rpc_addr());
+                    f.set_ptp_addr(addr.ptp_addr());
+                    if let Some(t) = &health.last_round {
+                        f.set_got_round(true);
+                        f.set_last_round_age((now - *t).as_secs_f64());
+                    }
+                    f.set_num_failures(health.num_failures);
+                    f.set_num_consecutive_failures(health.num_consecutive_failures);
+                    f.set_last_error(health.last_error.clone());
+                }
+            }
+
             if let Some(system_clock) = &state.system_clock {
                 let proto = out.system_clock_mut();
                 proto.set_steering(system_clock.steering);
@@ -242,6 +271,10 @@ impl TimeSyncNode {
     pub async fn configure(&self, config: &TimeSyncConfig) -> Result<()> {
         lock!(state <= self.shared.state.lock().await?, {
             state.config = config.clone();
+
+            if !config.has_leader() {
+                state.leader_peers.clear();
+            }
 
             if config.has_follower() {
                 state.follower_state = Some(FollowerState::default());
@@ -673,6 +706,7 @@ impl TimeSyncNode {
 
             leader_state.followers.insert(follower_key, LeaderPeer {
                 proto: follower.as_ref().clone(),
+                health: LeaderPeerHealth::default(),
                 configured: false,
                 rpc,
                 ptp_addr: follower.ptp_addr().parse()?
@@ -684,10 +718,28 @@ impl TimeSyncNode {
         // - These can't be parallelized since that would risk increasing network queueing and thus RTT
 
         for follower in leader_state.followers.values_mut() {
-            if let Err(e) = Self::run_leader_one_follower_sync(shared, config, follower).await {
-                eprintln!("Failed to sync to: {}: {}", follower.proto.rpc_addr(), e);
+            match Self::run_leader_one_follower_sync(shared, config, follower).await {
+                Ok(()) => {
+                    follower.health.last_round = Some(Instant::now());
+                    follower.health.num_consecutive_failures = 0;
+                }
+                Err(e) => {
+                    eprintln!("Failed to sync to: {}: {}", follower.proto.rpc_addr(), e);
+                    follower.health.num_failures += 1;
+                    follower.health.num_consecutive_failures += 1;
+                    follower.health.last_error = e.to_string();
+                }
             }
         }
+
+        let mut peers = leader_state.followers.values()
+            .map(|f| (f.proto.clone(), f.health.clone()))
+            .collect::<Vec<_>>();
+        peers.sort_by(|a, b| a.0.rpc_addr().cmp(b.0.rpc_addr()));
+
+        lock!(state <= shared.state.lock().await?, {
+            state.leader_peers = peers;
+        });
 
         Ok(())
     }
