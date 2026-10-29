@@ -437,8 +437,16 @@ mod tests {
         // Cameras keep joining: every join changes the leader's follower list, so its reported
         // config has not matched the wanted one for 30 s. It does lead, and is kept.
         let mut w = World::new();
-        w.cam(3, Some(99.0), None).cam(7, Some(99.0), Some(10.0));
-        w.health(3).reports_leader_config = true;
+        w.cam(3, None, None).cam(7, Some(99.0), Some(10.0));
+        let leading_with_an_old_follower_list = PtpStatusSummary {
+            configured: false,
+            is_leader: true,
+            ..Default::default()
+        };
+        for k in 70..=100 {
+            let at = w.at(k as f64);
+            w.health(3).record_status(at, &leading_with_an_old_follower_list);
+        }
         assert_eq!(w.choose(Some((3, 70.0)), 100.0), LeaderDecision { leader: Some(3), failed: None });
     }
 
@@ -666,6 +674,13 @@ mod tests {
         h.record_status(at(13.0), &PtpStatusSummary::default());
         assert_eq!(h.not_leading_since, Some(at(12.0)));
         h.record_status(at(14.0), &leading);
+        assert_eq!(h.not_leading_since, None);
+
+        // A leader whose wanted config just changed (a camera joined) is not configured, but
+        // still leads.
+        let changed = PtpStatusSummary { configured: false, is_leader: true, ..Default::default() };
+        h.record_status(at(15.0), &changed);
+        assert_eq!(h.configured_since, None);
         assert_eq!(h.not_leading_since, None);
     }
 }
