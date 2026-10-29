@@ -1,4 +1,4 @@
-use ptp_proto::ptp::TimeSyncConfig;
+use ptp_proto::ptp::{TimeAdjustmentConfig, TimeSyncConfig};
 
 
 // NOTE: the max PPM adjustment allowed by linux is +/- 500ppm
@@ -62,6 +62,20 @@ const DEFAULT_CONFIG_TEMPLATE_PROTO: &'static str = r#"
 
 "#;
 
+// Steering of a node's system clock (CLOCK_REALTIME) to its PTP clock, once a second.
+const DEFAULT_SYSTEM_CLOCK_SYNC_PROTO: &'static str = r#"
+    # The gains of phc2sys's defaults for a 1 s interval.
+    p_scale: 0.7
+    i_scale: 0.3
+
+    # Steps of CLOCK_REALTIME are exact, so a larger error is stepped, not slewed.
+    max_offset_seconds: 0.001
+    max_error_integral_secs: 0.01
+
+    # Above the follower's 100 ppm, so the system clock keeps up while the PTP clock slews.
+    max_correction_ppm: 200
+"#;
+
 lazy_static! {
     static ref DEFAULT_CONFIG_TEMPLATE: TimeSyncConfig = {
         let mut ptp_config = TimeSyncConfig::default();
@@ -73,4 +87,17 @@ lazy_static! {
 
 pub fn default_config_template() -> TimeSyncConfig {
     DEFAULT_CONFIG_TEMPLATE.clone()
+}
+
+lazy_static! {
+    static ref DEFAULT_SYSTEM_CLOCK_SYNC: TimeAdjustmentConfig = {
+        let mut config = TimeAdjustmentConfig::default();
+        protobuf::text::parse_text_proto(DEFAULT_SYSTEM_CLOCK_SYNC_PROTO, &mut config).unwrap();
+        config
+    };
+}
+
+/// Default servo settings for TimeSyncNode::set_system_clock_sync().
+pub fn default_system_clock_sync() -> TimeAdjustmentConfig {
+    DEFAULT_SYSTEM_CLOCK_SYNC.clone()
 }

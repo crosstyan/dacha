@@ -120,7 +120,34 @@ message StatusResponse {
     FollowerStatus follower = 2;
 
     FollowerStatus basic_client = 3;
-    
+
+    // Present while TimeSyncNode::set_system_clock_sync() is enabled on this node.
+    SystemClockStatus system_clock = 4;
+}
+
+// Steering of this node's system clock (CLOCK_REALTIME) to its PTP clock, the job phc2sys does
+// for ptp4l.
+message SystemClockStatus {
+    // True while the system clock is steered to the PTP clock.
+    bool steering = 1;
+
+    // Why the system clock is not steered, when 'steering' is false.
+    string reason = 2;
+
+    // PTP clock time minus system clock time in seconds, at the last sample.
+    double last_error = 3;
+
+    // Seconds taken to read the two clocks at the last sample.
+    double last_read_delay = 4;
+
+    // Seconds since the last sample.
+    double last_sample_age = 5;
+
+    // Frequency correction last applied to the system clock, in ppm.
+    double freq_ppm = 6;
+
+    // Number of times the system clock was stepped.
+    uint64 num_steps = 7;
 }
 
 message FollowerStatus {

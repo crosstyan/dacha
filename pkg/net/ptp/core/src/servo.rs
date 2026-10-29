@@ -140,6 +140,14 @@ impl PIFilterState {
         }
     }
 
+    /// Called while the filter is not fed (for example while its source is not
+    /// trusted). Forgets the time of the last update, so that the next update
+    /// does not integrate its error over the whole pause. The integral, which
+    /// holds the frequency difference, is kept.
+    pub fn hold(&mut self) {
+        self.last_time = None;
+    }
+
     fn output_ppm(config: &TimeAdjustmentConfig, error: f64, integral: f64) -> f64 {
         (config.p_scale() * error + config.i_scale() * integral) * 1_000_000.0
     }
@@ -247,9 +255,18 @@ mod tests {
     /// leader and runs 'drift_ppm' slow, syncing every 0.25 s with perfect
     /// measurements. Returns the error after each round.
     fn simulate(config: &TimeAdjustmentConfig, offset: f64, drift_ppm: f64, seconds: f64) -> Vec<f64> {
+        simulate_every(config, 0.25, offset, drift_ppm, seconds)
+    }
+
+    fn simulate_every(
+        config: &TimeAdjustmentConfig,
+        dt: f64,
+        offset: f64,
+        drift_ppm: f64,
+        seconds: f64,
+    ) -> Vec<f64> {
         let mut pi = PIFilterState::default();
         let start = Instant::now();
-        let dt = 0.25;
 
         let mut error = offset;
         let mut errors = vec![];
@@ -290,5 +307,32 @@ mod tests {
         let errors = simulate(config.follower().leader_clock_sync(), 0.5, 15.0, 60.0);
         assert!(errors[0].abs() < 1e-3);
         assert!(errors.last().unwrap().abs() < 100e-9);
+    }
+
+    #[test]
+    fn system_clock_locks_within_30_seconds() {
+        // Just below the 1 ms step limit, with a system clock 30 ppm off the PTP clock.
+        let config = crate::default_system_clock_sync();
+        let errors = simulate_every(&config, 1.0, 0.9e-3, 30.0, 60.0);
+
+        let worst_after = errors[30..].iter().map(|e| e.abs()).fold(0.0, f64::max);
+        assert!(worst_after < 1e-6, "still {} s off after 30 s", worst_after);
+    }
+
+    #[test]
+    fn held_filter_does_not_integrate_over_the_pause() {
+        let config = crate::default_system_clock_sync();
+        let error = 1e-6;
+        let start = Instant::now();
+
+        let mut pi = PIFilterState::default();
+        pi.update(&config, error, start);
+        pi.hold();
+        let c = pi.update(&config, error, start + Duration::from_secs(100));
+
+        // Only the proportional term. Integrating over the pause would add 30 ppm (a longer
+        // pause would reach the 200 ppm clamp, where the anti-windup hides it).
+        let expected = config.p_scale() * error * 1e6;
+        assert!((c.freq_ppm - expected).abs() < 1e-9, "{} ppm instead of {} ppm", c.freq_ppm, expected);
     }
 }

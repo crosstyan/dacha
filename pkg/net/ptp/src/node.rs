@@ -13,13 +13,20 @@ use cluster_client::{ClusterMetaClient, ServiceResolver};
 use protobuf::Message;
 use http::Resolver;
 use executor::sync::AsyncVariable;
-use ptp_core::{BasicTimeNode, MinRttFilter, PIFilterState, RttVerdict};
+use ptp_core::{BasicTimeNode, MinRttFilter, PIFilterState, RttVerdict, PhcTrust, PhcTrustInputs};
 
 use crate::signed_duration::*;
 use crate::socket::*;
 use crate::device::*;
 
 const ID_SIZE: usize = 8;
+
+/// How often the system clock is compared with the PTP clock.
+const SYSTEM_CLOCK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A comparison of the system clock and the PTP clock that took longer than this (the thread
+/// was preempted between the reads) is not used. On an RV1126B the reads take 1-2 us.
+const MAX_SYSTEM_CLOCK_READ_DELAY: Duration = Duration::from_micros(100);
 
 
 
@@ -46,6 +53,10 @@ struct State {
 
     basic_client_state: Option<FollowerState>,
 
+    /// Present while the system clock is steered to the PTP clock. Local to this node: not part
+    /// of the TimeSyncConfig set over RPC.
+    system_clock: Option<SystemClockState>,
+
     // TODO: Probably keep one record per peer address so that we gracefully support leadership changes.
     last_rx: Option<ReceivedPacket>,
     last_tx: Option<SentPacket>,
@@ -57,6 +68,22 @@ struct FollowerState {
     last_sync: Option<LastSyncMetadata>,
     rtt_filter: Option<MinRttFilter>,
     num_queued_rounds: u64,
+}
+
+struct SystemClockState {
+    config: TimeAdjustmentConfig,
+    pi_filter: PIFilterState,
+    steering: bool,
+    reason: String,
+    last_sample: Option<SystemClockSample>,
+    freq_ppm: f64,
+    num_steps: u64,
+}
+
+struct SystemClockSample {
+    time: Instant,
+    error: f64,
+    read_delay: f64,
 }
 
 struct LastSyncMetadata {
@@ -131,6 +158,9 @@ impl TimeSyncNode {
         resources.spawn_interruptable(
             "TimeSyncNode::server_thread", Self::server_thread(shared.clone())
         ).await;
+        resources.spawn_interruptable(
+            "TimeSyncNode::system_clock_thread", Self::system_clock_thread(shared.clone())
+        ).await;
 
         Self {
             shared,
@@ -170,8 +200,43 @@ impl TimeSyncNode {
                 }
             }
 
+            if let Some(system_clock) = &state.system_clock {
+                let proto = out.system_clock_mut();
+                proto.set_steering(system_clock.steering);
+                proto.set_reason(system_clock.reason.clone());
+                proto.set_freq_ppm(system_clock.freq_ppm);
+                proto.set_num_steps(system_clock.num_steps);
+                if let Some(sample) = &system_clock.last_sample {
+                    proto.set_last_error(sample.error);
+                    proto.set_last_read_delay(sample.read_delay);
+                    proto.set_last_sample_age((Instant::now() - sample.time).as_secs_f64());
+                }
+            }
+
             Ok(out)
         })
+    }
+
+    /// Enables or disables steering of the system clock (CLOCK_REALTIME) to the PTP clock, like
+    /// phc2sys does next to ptp4l. It is only steered while the PTP clock follows a source (see
+    /// ptp_core::phc_trust()). Disabling it leaves the system clock running at its last
+    /// frequency.
+    ///
+    /// Nothing else may adjust the system clock meanwhile (no NTP daemon, no phc2sys).
+    pub async fn set_system_clock_sync(&self, config: Option<TimeAdjustmentConfig>) -> Result<()> {
+        lock!(state <= self.shared.state.lock().await?, {
+            state.system_clock = config.map(|config| SystemClockState {
+                config,
+                pi_filter: PIFilterState::default(),
+                steering: false,
+                reason: "starting".to_string(),
+                last_sample: None,
+                freq_ppm: 0.0,
+                num_steps: 0,
+            });
+        });
+
+        Ok(())
     }
 
     pub async fn configure(&self, config: &TimeSyncConfig) -> Result<()> {
@@ -337,6 +402,86 @@ impl TimeSyncNode {
             // TODO: Add random jitter to this.
             executor::sleep(Duration::from_millis(100)).await?;
         }
+    }
+
+    async fn system_clock_thread(shared: Arc<Shared>) -> Result<()> {
+        loop {
+            executor::sleep(SYSTEM_CLOCK_INTERVAL).await?;
+
+            lock!(state <= shared.state.lock().await?, {
+                if let Err(e) = Self::run_system_clock_cycle(&shared, &mut *state) {
+                    eprintln!("TimeSyncNode::run_system_clock_cycle failed: {}", e);
+                    if let Some(system_clock) = state.system_clock.as_mut() {
+                        system_clock.steering = false;
+                        system_clock.reason = e.to_string();
+                        system_clock.pi_filter.hold();
+                    }
+                }
+            });
+        }
+    }
+
+    fn run_system_clock_cycle(shared: &Shared, state: &mut State) -> Result<()> {
+        let now = Instant::now();
+
+        let sync_age = |follower: &Option<FollowerState>| {
+            follower.as_ref()
+                .and_then(|f| f.last_sync.as_ref())
+                .map(|s| (now - s.time).as_secs_f64())
+        };
+
+        let ptp_time: Duration = shared.ptp_device.get_time()?.into();
+
+        let inputs = PhcTrustInputs {
+            is_leader: state.config.has_leader(),
+            is_follower: state.config.has_follower(),
+            has_basic_client: state.config.has_basic_client(),
+            follower_last_sync_age: sync_age(&state.follower_state),
+            basic_client_last_sync_age: sync_age(&state.basic_client_state),
+            ptp_time_secs: ptp_time.as_secs_f64(),
+        };
+
+        let system_clock = match state.system_clock.as_mut() {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+
+        if let PhcTrust::Untrusted(reason) = ptp_core::phc_trust(&inputs, ptp_core::DEFAULT_MAX_SYNC_AGE) {
+            system_clock.steering = false;
+            system_clock.reason = reason.to_string();
+            system_clock.pi_filter.hold();
+            return Ok(());
+        }
+
+        let offset = shared.ptp_device.offset_to(sys::ClockId::REALTIME)?;
+        if offset.rtt > MAX_SYSTEM_CLOCK_READ_DELAY {
+            return Err(format_err!("Reading the system and PTP clocks took {:?}", offset.rtt));
+        }
+
+        let error = (SignedDuration::from(offset.ptp_time) - SignedDuration::from(offset.other_time))
+            .as_secs_f64();
+
+        let correction = system_clock.pi_filter.update(&system_clock.config, error, now);
+
+        if let Some(step) = correction.step_seconds {
+            sys::ClockId::REALTIME.set_offset_secs_f64(step)?;
+            system_clock.num_steps += 1;
+        }
+
+        let mut adj = sys::ClockId::REALTIME.get_adjustments()?;
+        adj.set_freq((correction.freq_ppm * ((1 << 16) as f64)).round() as i64);
+        sys::ClockId::REALTIME.set_adjustments(&adj)?;
+
+        system_clock.steering = true;
+        system_clock.reason.clear();
+        system_clock.freq_ppm = correction.freq_ppm;
+        system_clock.last_sample = Some(SystemClockSample {
+            time: now,
+            error,
+            read_delay: offset.rtt.as_secs_f64(),
+        });
+
+        Ok(())
     }
 
     async fn run_leader_cycle(
