@@ -123,7 +123,10 @@ impl TimeSyncNode {
         resources.register_dependency(basic_node.clone()).await;
 
         resources.spawn_interruptable(
-            "TimeSyncNode::background_thread", Self::background_thread(shared.clone())
+            "TimeSyncNode::leader_thread", Self::leader_thread(shared.clone())
+        ).await;
+        resources.spawn_interruptable(
+            "TimeSyncNode::basic_client_thread", Self::basic_client_thread(shared.clone())
         ).await;
         resources.spawn_interruptable(
             "TimeSyncNode::server_thread", Self::server_thread(shared.clone())
@@ -285,9 +288,11 @@ impl TimeSyncNode {
         })
     }
 
-    async fn background_thread(shared: Arc<Shared>) -> Result<()> {
+    // The leader and the basic client run in separate threads: a time server that does not
+    // answer costs the basic client a 1 s ping timeout and a 1 s pause per cycle, and in a
+    // shared loop that slowed the leader's rounds from 4/s to one every 2 s.
+    async fn leader_thread(shared: Arc<Shared>) -> Result<()> {
         let mut leader_state = None;
-        let mut basic_client_state = None;
 
         loop {
             let config = lock!(state <= shared.state.lock().await?, {
@@ -304,6 +309,19 @@ impl TimeSyncNode {
             } else {
                 leader_state = None;
             }
+
+            // TODO: Add random jitter to this.
+            executor::sleep(Duration::from_millis(100)).await?;
+        }
+    }
+
+    async fn basic_client_thread(shared: Arc<Shared>) -> Result<()> {
+        let mut basic_client_state = None;
+
+        loop {
+            let config = lock!(state <= shared.state.lock().await?, {
+                state.config.clone()
+            });
 
             if config.has_basic_client() {
                 let state = basic_client_state.get_or_insert_default();
