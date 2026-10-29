@@ -20,6 +20,10 @@ use ptp_proto::ptp::{StatusResponse, TimeSyncConfig};
 /// replaced. A camera whose last successful status is older is not chosen.
 pub const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Timeout of each TimeSync RPC the manager makes. Well below STATUS_TIMEOUT,
+/// so that one RPC that hangs does not by itself make a leader fail.
+pub const PTP_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Once followers have been configured with the leader for this long, the
 /// leader must have completed a round with one of them within this time.
 pub const ROUND_TIMEOUT: Duration = Duration::from_secs(10);

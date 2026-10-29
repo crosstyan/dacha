@@ -158,6 +158,9 @@ struct CameraEntry {
     ptp_stub: Arc<TimeSyncStub>,
     ptp_health: PtpHealth,
 
+    /// The camera's last TimeSync status (from camera_ptp_monitor).
+    last_ptp_status: Option<ptp_proto::ptp::StatusResponse>,
+
     supervisor_stub: Option<Arc<SupervisorStub>>,
 
     task: Option<ChildTask<()>>,
@@ -305,6 +308,7 @@ impl MocapManager {
                         camera_stub,
                         ptp_stub,
                         ptp_health: PtpHealth::default(),
+                        last_ptp_status: None,
                         supervisor_stub: None,
                         task: Some(task),
                         status: None,
@@ -1046,6 +1050,7 @@ impl MocapManagerInner {
                     ptp_stub: conn.ptp_stub,
                     camera_stub: conn.camera_stub,
                     ptp_health: PtpHealth::default(),
+                    last_ptp_status: None,
                     supervisor_stub: Some(supervisor_stub),
                     status: None,
                     pending_save_intrinsics: None,
@@ -1211,7 +1216,8 @@ impl MocapManagerInner {
 
         loop {
             let mut bundle = TaskResultBundle::new();
-            bundle.add("Status", Self::camera_status_monitor(shared.clone(), camera_id, ptp_stub.clone(), camera_stub.clone(), supervisor_stub.clone()));
+            bundle.add("PtpStatus", Self::camera_ptp_monitor(shared.clone(), camera_id, ptp_stub.clone()));
+            bundle.add("Status", Self::camera_status_monitor(shared.clone(), camera_id, camera_stub.clone(), supervisor_stub.clone()));
             bundle.add("ReadBlobs", Self::camera_read_blobs_thread(shared.clone(), camera_id, camera_stub.clone()));
 
             let res = bundle.join().await;
@@ -1223,15 +1229,86 @@ impl MocapManagerInner {
         }
     }
 
+    /// Per-camera thread that keeps the camera's TimeSync status and config: it records the
+    /// status for the leader choice (ptp_leader_thread) and pushes the intended config.
+    ///
+    /// It runs apart from the camera status monitor, with its own RPC timeouts, so that a slow
+    /// camera RPC can not hold back the TimeSync status and get a working leader replaced. It
+    /// never fails: an RPC error is logged and the next round tries again.
+    async fn camera_ptp_monitor(
+        shared: Arc<Shared>,
+        camera_id: u64,
+        ptp_stub: Arc<TimeSyncStub>,
+    ) -> Result<()> {
+        let mut request_context = rpc::ClientRequestContext::default();
+        request_context.http.wait_for_ready = true;
+
+        loop {
+            if let Err(e) = Self::check_camera_ptp(&shared, camera_id, &ptp_stub, &request_context).await {
+                eprintln!(
+                    "[PTP] Camera {}: {}",
+                    entity_id_to_string(camera_id).unwrap_or_else(|| camera_id.to_string()), e
+                );
+            }
+
+            executor::sleep(Duration::from_secs(1)).await?;
+        }
+    }
+
+    async fn check_camera_ptp(
+        shared: &Arc<Shared>,
+        camera_id: u64,
+        ptp_stub: &TimeSyncStub,
+        request_context: &rpc::ClientRequestContext,
+    ) -> Result<()> {
+        let now = Instant::now();
+
+        let ptp_status = {
+            let req = ptp_proto::ptp::StatusRequest::default();
+            executor::timeout(PTP_RPC_TIMEOUT, ptp_stub.Status(request_context, &req))
+                .await
+                .map_err(|_| err_msg("Timed out on TimeSync Status"))?
+                .result?
+        };
+
+        let intended_ptp_config = Self::get_ptp_config(shared, camera_id).await?;
+
+        lock!(state <= shared.state.lock().await?, {
+            if let Some(entry) = state.cameras.get_mut(&camera_id) {
+                let summary = ptp_status_summary(&ptp_status, intended_ptp_config.as_ref());
+                entry.ptp_health.record_status(now, &summary);
+                entry.last_ptp_status = Some(ptp_status.clone());
+            }
+        });
+
+        // No PTP config is pushed while no leader is chosen: it would make every camera a
+        // follower, which demotes a leader that is still running.
+        if let Some(intended_ptp_config) = intended_ptp_config.filter(|c| ptp_status.config() != c) {
+            if intended_ptp_config.has_leader() {
+                // Ideally the leader is configured slightly after the followers to ensure the followers don't
+                // complain about not being configured yet when a leader sync occurs.
+                executor::sleep(Duration::from_millis(10)).await?;
+            }
+
+            let mut req = ptp_proto::ptp::ConfigureRequest::default();
+            req.set_config(intended_ptp_config);
+            executor::timeout(PTP_RPC_TIMEOUT, ptp_stub.Configure(request_context, &req))
+                .await
+                .map_err(|_| err_msg("Timed out on TimeSync Configure"))?
+                .result?;
+        }
+
+        Ok(())
+    }
+
     /// Per-camera thread which has two jobs:
-    /// - Checks the status of the PTP and camera code.
+    /// - Checks the status of the camera code.
     /// - Configures the camera once PTP is syncronized.
     ///
     /// TODO: This will need RPC timeouts.
     async fn camera_status_monitor(
         shared: Arc<Shared>,
         camera_id: u64,
-        ptp_stub: Arc<TimeSyncStub>,
         camera_stub: Arc<CameraStub>,
         supervisor_stub: Option<Arc<SupervisorStub>>
     ) -> Result<()> {
@@ -1254,36 +1331,6 @@ impl MocapManagerInner {
                     last_link_check = Some(now);
                     link_speed_mbps = Self::read_link_speed(supervisor_stub).await;
                 }
-            }
-
-            let ptp_status = {
-                let req = ptp_proto::ptp::StatusRequest::default();
-                ptp_stub.Status(&request_context, &req).await.result?
-            };
-
-            let intended_ptp_config = Self::get_ptp_config(&shared, camera_id).await?;
-
-            lock!(state <= shared.state.lock().await?, {
-                if let Some(entry) = state.cameras.get_mut(&camera_id) {
-                    let summary = ptp_status_summary(&ptp_status, intended_ptp_config.as_ref());
-                    entry.ptp_health.record_status(now, &summary);
-                }
-            });
-
-            // No PTP config is pushed while no leader is chosen: it would make every camera a
-            // follower, which demotes a leader that is still running.
-            if let Some(intended_ptp_config) = intended_ptp_config.filter(|c| ptp_status.config() != c) {
-                // eprintln!("Configuring PTP for camera...");
-
-                if intended_ptp_config.has_leader() {
-                    // Ideally the leader is configured slightly after the followers to ensure the followers don't
-                    // complain about not being configured yet when a leader sync occurs.
-                    executor::sleep(Duration::from_millis(10)).await?;
-                }
-
-                let mut req = ptp_proto::ptp::ConfigureRequest::default();
-                req.set_config(intended_ptp_config);
-                ptp_stub.Configure(&request_context, &req).await.result?;
             }
 
             let mut status = {
@@ -1342,7 +1389,7 @@ impl MocapManagerInner {
                 // 
                 entry.status = Some(CameraStatus {
                     status: status.clone(),
-                    ptp_status,
+                    ptp_status: entry.last_ptp_status.clone().unwrap_or_default(),
                     check_time: now,
                     link_speed_mbps,
                 });
