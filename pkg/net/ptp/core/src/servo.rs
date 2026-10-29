@@ -464,13 +464,24 @@ mod tests {
         // promoted to leader, or a manager restart).
         let config = default_config_template().basic_client().clock_sync().clone();
         let mut pi = PIFilterState::starting_at(&config, 15.0);
-        let c = pi.update(&config, 0.005, Instant::now());
+        let start = Instant::now();
+        let c = pi.update(&config, 0.005, start);
 
         assert!(
             (c.freq_ppm - 15.0).abs() <= config.max_frequency_step_ppm() + 1e-9,
             "first output {} ppm",
             c.freq_ppm
         );
+
+        // The integral must hold that frequency too. The step limiter keeps the first output
+        // near 15 ppm whatever the integral is; with a wrong one the output then walks away
+        // by 0.001 ppm per update.
+        let mut pi = PIFilterState::starting_at(&config, 15.0);
+        let mut out = 0.0;
+        for k in 0..2000 {
+            out = pi.update(&config, 0.0, start + Duration::from_secs_f64(k as f64 * 0.5)).freq_ppm;
+        }
+        assert!((out - 15.0).abs() < 0.01, "{} ppm after 2000 updates with no error", out);
     }
 
     #[test]

@@ -301,7 +301,15 @@ impl TimeSyncNode {
     }
 
     pub async fn configure(&self, config: &TimeSyncConfig) -> Result<()> {
-        let phc_freq_ppm = self.shared.ptp_device.clock().get_adjustments()?.freq() as f64 / 65536.0;
+        // New servo states start from the frequency the PTP clock runs at now. Not being able to
+        // read it is no reason to refuse the config: those states then start at 0 ppm.
+        let phc_freq_ppm = match self.shared.ptp_device.clock().get_adjustments() {
+            Ok(adj) => adj.freq() as f64 / 65536.0,
+            Err(e) => {
+                eprintln!("TimeSyncNode::configure: cannot read the PTP clock frequency: {}", e);
+                0.0
+            }
+        };
 
         lock!(state <= self.shared.state.lock().await?, {
             let old_config = std::mem::replace(&mut state.config, config.clone());
@@ -310,7 +318,8 @@ impl TimeSyncNode {
                 state.leader_peers.clear();
             }
 
-            state.follower_state = reconfigure_follower(&old_config, config, state.follower_state.take());
+            state.follower_state = reconfigure_follower(
+                &old_config, config, state.follower_state.take(), phc_freq_ppm);
             state.basic_client_state = reconfigure_basic_client(
                 &old_config, config, state.basic_client_state.take(), phc_freq_ppm);
 
@@ -957,10 +966,14 @@ impl TimeSyncNode {
 /// the manager reconfigures every follower when the leader changes, and the new leader was
 /// locked to the old one. Only the state that belongs to the old leader's rounds (its path's
 /// minimum RTT, its last sync) is dropped.
+///
+/// A new state starts from 'phc_freq_ppm', the frequency the PTP clock runs at now: a leader
+/// demoted to follower already runs at about the rate of the group.
 fn reconfigure_follower(
     old: &TimeSyncConfig,
     new: &TimeSyncConfig,
     state: Option<FollowerState>,
+    phc_freq_ppm: f64,
 ) -> Option<FollowerState> {
     match (new.has_follower(), state) {
         (false, _) => None,
@@ -972,7 +985,10 @@ fn reconfigure_follower(
             }
             Some(follower_state)
         }
-        (true, _) => Some(FollowerState::default()),
+        (true, _) => Some(FollowerState {
+            pi_filter: PIFilterState::starting_at(new.follower().leader_clock_sync(), phc_freq_ppm),
+            ..Default::default()
+        }),
     }
 }
 
@@ -1065,21 +1081,35 @@ mod tests {
         let old = follower_of("10.0.0.1:319");
         let new = follower_of("10.0.0.2:319");
 
-        let state = reconfigure_follower(&old, &new, Some(used_state())).unwrap();
+        let state = reconfigure_follower(&old, &new, Some(used_state()), 0.0).unwrap();
         // The same state (its counter survived), without the old leader's path.
         assert_eq!(state.num_queued_rounds, 7);
         assert!(state.rtt_filter.is_none());
         assert!(state.last_sync.is_none());
 
         // An unchanged config keeps everything.
-        let state = reconfigure_follower(&old, &old, Some(used_state())).unwrap();
+        let state = reconfigure_follower(&old, &old, Some(used_state()), 0.0).unwrap();
         assert!(state.rtt_filter.is_some());
         assert!(state.last_sync.is_some());
 
         // A node that becomes a follower starts fresh; one that stops has none.
         let leader = TimeSyncConfig::default();
-        assert_eq!(reconfigure_follower(&leader, &new, Some(used_state())).unwrap().num_queued_rounds, 0);
-        assert!(reconfigure_follower(&new, &leader, Some(used_state())).is_none());
+        assert_eq!(reconfigure_follower(&leader, &new, Some(used_state()), 0.0).unwrap().num_queued_rounds, 0);
+        assert!(reconfigure_follower(&new, &leader, Some(used_state()), 0.0).is_none());
+    }
+
+    #[test]
+    fn demoted_leader_starts_its_follower_filter_at_the_clock_frequency() {
+        // A leader whose PTP clock runs at +15 ppm becomes a follower. Starting its filter at
+        // 0 ppm would pull the clock 15 ppm off the group until the integral relearns it
+        // (23 us off at worst, 48 s to settle).
+        let leader = TimeSyncConfig::default();
+        let new = follower_of("10.0.0.2:319");
+        let config = new.follower().leader_clock_sync().clone();
+
+        let mut state = reconfigure_follower(&leader, &new, None, 15.0).unwrap();
+        let c = state.pi_filter.update(&config, 0.0, Instant::now());
+        assert!((c.freq_ppm - 15.0).abs() < 1e-6, "first output {} ppm instead of 15 ppm", c.freq_ppm);
     }
 
     #[test]
@@ -1092,7 +1122,7 @@ mod tests {
 
         let mut state = FollowerState::default();
         state.pi_filter.update(&config, error, start);
-        let mut state = reconfigure_follower(&old, &new, Some(state)).unwrap();
+        let mut state = reconfigure_follower(&old, &new, Some(state), 0.0).unwrap();
         let c = state.pi_filter.update(&config, error, start + Duration::from_secs(100));
 
         // The first round from the new leader adds only the proportional term. Integrating the
