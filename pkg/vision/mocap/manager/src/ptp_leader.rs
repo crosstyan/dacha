@@ -48,6 +48,10 @@ pub struct PtpHealth {
     /// wants it to have.
     pub configured_since: Option<Instant>,
 
+    /// Since when the camera has reported a TimeSync config other than the one the manager
+    /// wants it to have (None while it has the wanted one).
+    pub unconfigured_since: Option<Instant>,
+
     /// Whether the camera's last status listed any followers in its leader
     /// status. Cameras from before the leader status never do; such a leader
     /// is judged by its Status RPC only.
@@ -103,8 +107,10 @@ impl PtpHealth {
 
         if status.configured {
             self.configured_since.get_or_insert(now);
+            self.unconfigured_since = None;
         } else {
             self.configured_since = None;
+            self.unconfigured_since.get_or_insert(now);
         }
 
         self.reports_leader_config = status.is_leader;
@@ -128,6 +134,9 @@ pub enum LeaderFailure {
 
     /// The leader has completed no round with any follower within ROUND_TIMEOUT.
     NoRounds,
+
+    /// The leader answers but has not taken its config for ROUND_TIMEOUT, so it does not lead.
+    NotConfigured,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -217,6 +226,14 @@ fn leader_failure(
 ) -> Option<LeaderFailure> {
     if !status_fresh(leader.health, now) && now.saturating_duration_since(since) > STATUS_TIMEOUT {
         return Some(LeaderFailure::StatusFailing);
+    }
+
+    // A config differs from the wanted one for up to a monitor loop whenever it changes (a
+    // camera joins or leaves), so only a leader that stays without it for ROUND_TIMEOUT fails.
+    if let Some(t) = leader.health.unconfigured_since {
+        if now.saturating_duration_since(t.max(since)) > ROUND_TIMEOUT {
+            return Some(LeaderFailure::NotConfigured);
+        }
     }
 
     // Cameras from before the leader status: nothing more to judge by.
@@ -385,6 +402,29 @@ mod tests {
             w.choose(Some((3, 10.0)), 100.0),
             LeaderDecision { leader: Some(7), failed: Some((3, LeaderFailure::StatusFailing)) }
         );
+    }
+
+    #[test]
+    fn leader_that_never_takes_its_config_is_replaced() {
+        let mut w = World::new();
+        w.cam(3, Some(99.0), None).cam(7, Some(99.0), Some(10.0));
+        w.health(3).unconfigured_since = Some(w.at(10.0));
+
+        // Within ROUND_TIMEOUT of becoming the leader it is still waited for.
+        assert_eq!(w.choose(Some((3, 10.0)), 19.0), LeaderDecision { leader: Some(3), failed: None });
+        assert_eq!(
+            w.choose(Some((3, 10.0)), 21.0),
+            LeaderDecision { leader: Some(7), failed: Some((3, LeaderFailure::NotConfigured)) }
+        );
+
+        // A leader whose config changed a moment ago (a camera joined) is kept.
+        w.health(3).unconfigured_since = Some(w.at(99.0));
+        assert_eq!(w.choose(Some((3, 10.0)), 100.0), LeaderDecision { leader: Some(3), failed: None });
+
+        // The time counts from when it became the leader: a camera without the config it had
+        // as a follower gets ROUND_TIMEOUT to take its leader config.
+        w.health(3).unconfigured_since = Some(w.at(0.0));
+        assert_eq!(w.choose(Some((3, 95.0)), 100.0), LeaderDecision { leader: Some(3), failed: None });
     }
 
     #[test]
@@ -599,9 +639,17 @@ mod tests {
         assert!(h.reports_leader_rounds);
         assert_eq!(h.last_leader_round, Some(at(10.75)));
 
+        assert_eq!(h.unconfigured_since, None);
+
         h.record_status(at(12.0), &PtpStatusSummary::default());
         assert_eq!(h.configured_since, None);
         assert!(!h.reports_leader_rounds);
         assert_eq!(h.last_leader_round, None);
+
+        // Unconfigured since the first status that shows it, until configured again.
+        h.record_status(at(13.0), &PtpStatusSummary::default());
+        assert_eq!(h.unconfigured_since, Some(at(12.0)));
+        h.record_status(at(14.0), &leading);
+        assert_eq!(h.unconfigured_since, None);
     }
 }
