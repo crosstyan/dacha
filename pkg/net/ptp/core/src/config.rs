@@ -23,10 +23,11 @@ const DEFAULT_CONFIG_TEMPLATE_PROTO: &'static str = r#"
             # Must be larger than the leader -> ntp one
             max_correction_ppm: 100
         }
-        # A ceiling only: the RTT with no queueing depends on the link speed and the
-        # switches (28 us between two 100 Mbit/s cameras on one switch).
-        # 'max_rtt_above_min' does the filtering.
-        max_network_rtt: 0.0001 # 100us
+        # A ceiling for faults only; 'max_rtt_above_min' does the filtering. The RTT with
+        # no queueing depends on the link speed and the switches (28 us between two
+        # 100 Mbit/s cameras on one switch), and one full-size frame queued ahead at
+        # 100 Mbit/s adds 123 us. A round above this limit is an RPC error.
+        max_network_rtt: 0.001 # 1ms
         max_sample_age: 0.1
 
         # Recorded on two 100 Mbit/s cameras with 20 Mbit/s of other traffic: 0.5 us kept
