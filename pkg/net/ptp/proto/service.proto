@@ -73,6 +73,11 @@ message FollowerConfig {
     float max_rtt_above_min = 4;
 
     uint32 rtt_min_window = 5;
+
+    // Address ("ip:port") of the leader's PTP socket. When set, the follower answers and uses
+    // rounds from this address only, so a replaced leader that is still running can not steer
+    // it. Empty accepts rounds from any leader (managers before this field).
+    string leader_ptp_addr = 6;
 }
 
 message TimeSyncPeerAddr {

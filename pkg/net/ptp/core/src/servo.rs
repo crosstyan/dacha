@@ -4,7 +4,23 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use net::ip::SocketAddr;
 use ptp_proto::ptp::{FollowerConfig, TimeAdjustmentConfig};
+
+/// Whether a follower with this config may answer and use a sync round that came from
+/// 'peer'. With FollowerConfig.leader_ptp_addr set, only that address may; an address that
+/// does not parse accepts nothing.
+pub fn is_from_leader(config: &FollowerConfig, peer: &SocketAddr) -> bool {
+    let leader = config.leader_ptp_addr();
+    if leader.is_empty() {
+        return true;
+    }
+
+    match leader.parse::<SocketAddr>() {
+        Ok(addr) => addr == *peer,
+        Err(_) => false,
+    }
+}
 
 /// Round trip time in nanoseconds of one sync round. The leader sent its packet at
 /// 'remote_tx' and got the reply at 'remote_rx' (leader clock); the follower got the
@@ -29,9 +45,13 @@ pub fn round_trip_time(remote_tx: u64, remote_rx: u64, local_rx: u64, local_tx: 
 /// depends on the link speed and on the switches in the path (28 us between
 /// two 100 Mbit/s cameras on one switch, against a 10 us default meant for
 /// 1 Gbit/s).
+///
+/// The minimum belongs to one path, so the window restarts when the rounds start
+/// coming from another leader (see check_from()).
 pub struct MinRttFilter {
     window: usize,
     samples: VecDeque<u64>,
+    source: Option<String>,
 }
 
 impl MinRttFilter {
@@ -39,7 +59,21 @@ impl MinRttFilter {
         Self {
             window: window.max(1),
             samples: VecDeque::new(),
+            source: None,
         }
+    }
+
+    /// Like check(), for a round whose leader is 'source' (any stable name, such as
+    /// its address). A round from a different leader than the last one restarts the
+    /// window: a new leader on a path even 1 us longer would otherwise have every
+    /// round skipped as queued until the old minimum left the window (16 s).
+    pub fn check_from(&mut self, source: &str, config: &FollowerConfig, rtt: u64) -> RttVerdict {
+        if self.source.as_deref() != Some(source) {
+            self.samples.clear();
+            self.source = Some(source.to_string());
+        }
+
+        self.check(config, rtt)
     }
 
     /// Records one RTT in nanoseconds and returns the minimum over the window,
@@ -262,6 +296,43 @@ mod tests {
         assert_eq!(f.add(50), 20);
         assert_eq!(f.add(60), 40);
         assert_eq!(f.min(), Some(40));
+    }
+
+    #[test]
+    fn new_leader_on_a_longer_path_is_not_locked_out() {
+        let config = default_config_template();
+        let follower = config.follower();
+
+        let mut filter = MinRttFilter::new(follower.rtt_min_window() as usize);
+        for _ in 0..64 {
+            assert_eq!(filter.check_from("10.0.0.1:319", follower, 28_000), RttVerdict::Usable);
+        }
+
+        // The new leader's path is 1 us longer, well above the 0.5 us margin over the old
+        // minimum.
+        assert_eq!(filter.check_from("10.0.0.2:319", follower, 29_000), RttVerdict::Usable);
+        assert_eq!(filter.check_from("10.0.0.2:319", follower, 29_100), RttVerdict::Usable);
+        // Queueing behind the new minimum is still caught.
+        assert_eq!(filter.check_from("10.0.0.2:319", follower, 35_000), RttVerdict::Queued);
+    }
+
+    #[test]
+    fn follower_uses_rounds_from_its_leader_only() {
+        let mut config = default_config_template().follower().clone();
+        let leader: SocketAddr = "192.168.2.64:319".parse().unwrap();
+        let other: SocketAddr = "192.168.2.65:319".parse().unwrap();
+        let other_port: SocketAddr = "192.168.2.64:320".parse().unwrap();
+
+        // No leader address (older managers): any peer.
+        assert!(is_from_leader(&config, &other));
+
+        config.set_leader_ptp_addr("192.168.2.64:319");
+        assert!(is_from_leader(&config, &leader));
+        assert!(!is_from_leader(&config, &other));
+        assert!(!is_from_leader(&config, &other_port));
+
+        config.set_leader_ptp_addr("not an address");
+        assert!(!is_from_leader(&config, &leader));
     }
 
     #[test]

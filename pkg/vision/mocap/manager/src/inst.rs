@@ -1534,6 +1534,12 @@ impl MocapManagerInner {
 
             } else {
                 ptp_config.set_follower(template.follower().clone());
+
+                // The follower then ignores any other camera that still acts as a leader.
+                let leader_entry = state.ptp_leader.and_then(|(id, _)| state.cameras.get(&id));
+                if let Some(leader_entry) = leader_entry {
+                    ptp_config.follower_mut().set_leader_ptp_addr(leader_entry.ptp_addr.clone());
+                }
             }
 
             Ok(ptp_config)

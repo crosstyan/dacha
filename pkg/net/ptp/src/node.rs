@@ -276,23 +276,41 @@ impl TimeSyncNode {
 
     pub async fn configure(&self, config: &TimeSyncConfig) -> Result<()> {
         lock!(state <= self.shared.state.lock().await?, {
-            state.config = config.clone();
+            let old_config = std::mem::replace(&mut state.config, config.clone());
 
             if !config.has_leader() {
                 state.leader_peers.clear();
             }
 
-            if config.has_follower() {
-                state.follower_state = Some(FollowerState::default());
-            } else {
-                state.follower_state = None;
-            }
+            // A node that stays a follower keeps its PI filter, which holds the frequency
+            // it learned: the manager reconfigures every follower when the leader changes, and
+            // the new leader was locked to the old one. Only the state that belongs to the old
+            // leader's rounds (its path's minimum RTT, its last sync) is dropped.
+            state.follower_state = match (config.has_follower(), state.follower_state.take()) {
+                (false, _) => None,
+                (true, Some(mut follower_state)) if old_config.has_follower() => {
+                    if old_config.follower() != config.follower() {
+                        follower_state.rtt_filter = None;
+                        follower_state.last_sync = None;
+                        follower_state.pi_filter.hold();
+                    }
+                    Some(follower_state)
+                }
+                (true, _) => Some(FollowerState::default()),
+            };
 
-            if config.has_basic_client() {
-                state.basic_client_state = Some(FollowerState::default());
-            } else {
-                state.basic_client_state = None;
-            }
+            // The same for the basic client, whose step-limited servo needs a long time to
+            // learn its frequency again (the leader's follower list changes with every
+            // camera that comes or goes).
+            state.basic_client_state = match (config.has_basic_client(), state.basic_client_state.take()) {
+                (false, _) => None,
+                (true, Some(basic_state))
+                    if old_config.has_basic_client() && old_config.basic_client() == config.basic_client() =>
+                {
+                    Some(basic_state)
+                }
+                (true, _) => Some(FollowerState::default()),
+            };
 
             Ok(())
         })
@@ -311,6 +329,12 @@ impl TimeSyncNode {
 
             let local_rx = state.last_rx.take()
                 .ok_or_else(|| err_msg("No PTP packet received recently"))?;
+            if !ptp_core::is_from_leader(state.config.follower(), &local_rx.peer_addr) {
+                return Err(format_err!(
+                    "PTP round from {:?}, which is not the leader {}",
+                    local_rx.peer_addr, state.config.follower().leader_ptp_addr()
+                ));
+            }
             if &local_rx.rx_id != remote_point.tx_id() {
                 return Err(err_msg("Local RX / remote TX mismatch"));
             }
@@ -328,7 +352,7 @@ impl TimeSyncNode {
             let follower_config = state.config.follower();
             let verdict = follower_state.rtt_filter
                 .get_or_insert_with(|| MinRttFilter::new(follower_config.rtt_min_window() as usize))
-                .check(follower_config, rtt);
+                .check_from(&local_rx.peer_addr.to_string(), follower_config, rtt);
 
             let rtt = Duration::from_nanos(rtt);
 
@@ -860,8 +884,6 @@ impl TimeSyncNode {
 
             let time = Instant::now();
 
-            // TODO: Reject if not received from the leader address.
-
             let rx_id = buf[0..n_received].to_vec();
 
             // println!("RX: {:?}: {:?}", peer_addr, rx_id);
@@ -874,7 +896,15 @@ impl TimeSyncNode {
                 // if state.last_rx.is_some() {
                 //     return Ok(());
                 // }
-                
+
+                // A follower answers only its own leader (when the manager named one), so a
+                // replaced leader that still runs can not take rounds away from the new one.
+                if state.config.has_follower()
+                    && !ptp_core::is_from_leader(state.config.follower(), &peer_addr)
+                {
+                    return Result::<_, Error>::Ok(());
+                }
+
                 state.last_rx = Some(ReceivedPacket {
                     time,
                     peer_addr: peer_addr.clone(),
