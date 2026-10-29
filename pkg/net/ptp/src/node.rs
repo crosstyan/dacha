@@ -282,35 +282,9 @@ impl TimeSyncNode {
                 state.leader_peers.clear();
             }
 
-            // A node that stays a follower keeps its PI filter, which holds the frequency
-            // it learned: the manager reconfigures every follower when the leader changes, and
-            // the new leader was locked to the old one. Only the state that belongs to the old
-            // leader's rounds (its path's minimum RTT, its last sync) is dropped.
-            state.follower_state = match (config.has_follower(), state.follower_state.take()) {
-                (false, _) => None,
-                (true, Some(mut follower_state)) if old_config.has_follower() => {
-                    if old_config.follower() != config.follower() {
-                        follower_state.rtt_filter = None;
-                        follower_state.last_sync = None;
-                        follower_state.pi_filter.hold();
-                    }
-                    Some(follower_state)
-                }
-                (true, _) => Some(FollowerState::default()),
-            };
-
-            // The same for the basic client, whose step-limited servo needs a long time to
-            // learn its frequency again (the leader's follower list changes with every
-            // camera that comes or goes).
-            state.basic_client_state = match (config.has_basic_client(), state.basic_client_state.take()) {
-                (false, _) => None,
-                (true, Some(basic_state))
-                    if old_config.has_basic_client() && old_config.basic_client() == config.basic_client() =>
-                {
-                    Some(basic_state)
-                }
-                (true, _) => Some(FollowerState::default()),
-            };
+            state.follower_state = reconfigure_follower(&old_config, config, state.follower_state.take());
+            state.basic_client_state =
+                reconfigure_basic_client(&old_config, config, state.basic_client_state.take());
 
             Ok(())
         })
@@ -934,6 +908,50 @@ impl TimeSyncNode {
     }
 }
 
+/// The follower state after a reconfiguration from 'old' to 'new'.
+///
+/// A node that stays a follower keeps its PI filter, which holds the frequency it learned:
+/// the manager reconfigures every follower when the leader changes, and the new leader was
+/// locked to the old one. Only the state that belongs to the old leader's rounds (its path's
+/// minimum RTT, its last sync) is dropped.
+fn reconfigure_follower(
+    old: &TimeSyncConfig,
+    new: &TimeSyncConfig,
+    state: Option<FollowerState>,
+) -> Option<FollowerState> {
+    match (new.has_follower(), state) {
+        (false, _) => None,
+        (true, Some(mut follower_state)) if old.has_follower() => {
+            if old.follower() != new.follower() {
+                follower_state.rtt_filter = None;
+                follower_state.last_sync = None;
+                follower_state.pi_filter.hold();
+            }
+            Some(follower_state)
+        }
+        (true, _) => Some(FollowerState::default()),
+    }
+}
+
+/// The basic client state after a reconfiguration: kept while the basic client config is
+/// unchanged, since its step-limited servo needs a long time to learn its frequency again and
+/// the leader's config changes with every camera that comes or goes.
+fn reconfigure_basic_client(
+    old: &TimeSyncConfig,
+    new: &TimeSyncConfig,
+    state: Option<FollowerState>,
+) -> Option<FollowerState> {
+    match (new.has_basic_client(), state) {
+        (false, _) => None,
+        (true, Some(basic_state))
+            if old.has_basic_client() && old.basic_client() == new.basic_client() =>
+        {
+            Some(basic_state)
+        }
+        (true, _) => Some(FollowerState::default()),
+    }
+}
+
 #[async_trait]
 impl TimeSyncService for TimeSyncNode {
 
@@ -962,5 +980,62 @@ impl TimeSyncService for TimeSyncNode {
     ) -> Result<()> {
         self.sync(&request.value).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn follower_of(leader: &str) -> TimeSyncConfig {
+        let mut config = TimeSyncConfig::default();
+        config.set_follower(ptp_core::default_config_template().follower().clone());
+        config.follower_mut().set_leader_ptp_addr(leader);
+        config
+    }
+
+    fn used_state() -> FollowerState {
+        let mut state = FollowerState::default();
+        state.num_queued_rounds = 7;
+        state.rtt_filter = Some(MinRttFilter::new(64));
+        state.last_sync = Some(LastSyncMetadata { time: Instant::now(), rtt: 28e-6, error: 1e-8 });
+        state
+    }
+
+    #[test]
+    fn follower_keeps_its_state_when_the_leader_changes() {
+        let old = follower_of("10.0.0.1:319");
+        let new = follower_of("10.0.0.2:319");
+
+        let state = reconfigure_follower(&old, &new, Some(used_state())).unwrap();
+        // The same state (its counter survived), without the old leader's path.
+        assert_eq!(state.num_queued_rounds, 7);
+        assert!(state.rtt_filter.is_none());
+        assert!(state.last_sync.is_none());
+
+        // An unchanged config keeps everything.
+        let state = reconfigure_follower(&old, &old, Some(used_state())).unwrap();
+        assert!(state.rtt_filter.is_some());
+        assert!(state.last_sync.is_some());
+
+        // A node that becomes a follower starts fresh; one that stops has none.
+        let leader = TimeSyncConfig::default();
+        assert_eq!(reconfigure_follower(&leader, &new, Some(used_state())).unwrap().num_queued_rounds, 0);
+        assert!(reconfigure_follower(&new, &leader, Some(used_state())).is_none());
+    }
+
+    #[test]
+    fn basic_client_keeps_its_state_while_its_config_is_unchanged() {
+        let mut old = TimeSyncConfig::default();
+        old.set_basic_client(ptp_core::default_config_template().basic_client().clone());
+        old.basic_client_mut().set_server_addr("10.0.0.9:400");
+
+        // The leader's follower list changed, the basic client did not.
+        let mut new = old.clone();
+        new.leader_mut().new_followers().set_ptp_addr("10.0.0.3:319");
+        assert_eq!(reconfigure_basic_client(&old, &new, Some(used_state())).unwrap().num_queued_rounds, 7);
+
+        new.basic_client_mut().set_server_addr("10.0.0.8:400");
+        assert_eq!(reconfigure_basic_client(&old, &new, Some(used_state())).unwrap().num_queued_rounds, 0);
     }
 }
