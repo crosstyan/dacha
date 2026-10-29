@@ -24,9 +24,10 @@ const ID_SIZE: usize = 8;
 /// How often the system clock is compared with the PTP clock.
 const SYSTEM_CLOCK_INTERVAL: Duration = Duration::from_secs(1);
 
-/// A comparison of the system clock and the PTP clock that took longer than this (the thread
-/// was preempted between the reads) is not used. On an RV1126B the reads take 1-2 us.
-const MAX_SYSTEM_CLOCK_READ_DELAY: Duration = Duration::from_micros(100);
+/// A comparison of the system clock and the PTP clock whose read window is longer than this
+/// (the thread was preempted between the reads) is not used: the window bounds the error at
+/// half its length. On an RV1126B (stmmac, offset_by_reads) the window is about 5.5 us.
+const MAX_SYSTEM_CLOCK_READ_DELAY: Duration = Duration::from_micros(20);
 
 /// CLOCK_REALTIME advances by tick us per USER_HZ tick; USER_HZ is 100 on arm, arm64 and x86,
 /// so the nominal tick is 10000. linuxptp (ptp4l -S, phc2sys) moves large corrections into the
@@ -458,6 +459,10 @@ impl TimeSyncNode {
                 .and_then(|f| f.last_sync.as_ref())
                 .map(|s| (now - s.time).as_secs_f64())
         };
+
+        if state.system_clock.is_none() {
+            return Ok(());
+        }
 
         let ptp_time: Duration = shared.ptp_device.get_time()?.into();
 

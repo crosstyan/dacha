@@ -26,19 +26,19 @@ fn ns(seconds: f64) -> String {
     format!("{}", (seconds * 1e9).round())
 }
 
-fn print_follower(name: &str, s: &FollowerStatus) {
+/// 'rtt_window': also print the minimum RTT and the queued rounds, which only a follower
+/// of a leader has. They are printed even before the first usable sync, when they tell why
+/// there is none (a minimum of 0 is printed as such).
+fn print_follower(name: &str, s: &FollowerStatus, rtt_window: bool) {
     println!("{}", name);
     println!("  got_sync           {}", s.got_sync());
-    if !s.got_sync() {
-        return;
+    if s.got_sync() {
+        println!("  last_error_ns      {}", ns(s.last_leader_error()));
+        println!("  last_rtt_ns        {}", ns(s.last_leader_rtt()));
+        println!("  last_sync_age_s    {:.3}", s.last_sync_age());
     }
-    println!("  last_error_ns      {}", ns(s.last_leader_error()));
-    println!("  last_rtt_ns        {}", ns(s.last_leader_rtt()));
-    println!("  last_sync_age_s    {:.3}", s.last_sync_age());
-    if s.min_rtt() != 0.0 {
+    if rtt_window {
         println!("  min_rtt_ns         {}", ns(s.min_rtt()));
-    }
-    if s.num_queued_rounds() != 0 {
         println!("  queued_rounds      {}", s.num_queued_rounds());
     }
 }
@@ -62,11 +62,11 @@ fn print_status(status: &StatusResponse) {
     println!("role                 {}", roles.join(", "));
 
     if config.has_follower() {
-        print_follower("follower", status.follower());
+        print_follower("follower", status.follower(), true);
     }
 
     if config.has_basic_client() {
-        print_follower("basic_client", status.basic_client());
+        print_follower("basic_client", status.basic_client(), false);
     }
 
     if status.has_system_clock() {

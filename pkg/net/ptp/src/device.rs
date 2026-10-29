@@ -68,29 +68,12 @@ impl PTPDevice {
             Err(e) => return Err(e.into()),
         }
 
-        let mut best_offset = PTPClockOffset {
-            ptp_time: Duration::ZERO,
-            other_time: Duration::ZERO,
-            rtt: Duration::ZERO
-        };
+        let samples = (0..3)
+            .map(|i| (to_dur(&data.ts[i][0]), to_dur(&data.ts[i][1]), to_dur(&data.ts[i][2])))
+            .collect::<Vec<_>>();
 
-        for i in 0..3 {
-            let other_time = to_dur(&data.ts[i][0]);
-            let ptp_time = to_dur(&data.ts[i][1]);
-            let other_time2 = to_dur(&data.ts[i][2]);
-            let rtt = other_time2.checked_sub(other_time)
-                .ok_or_else(|| err_msg("The other clock went backwards while reading the PTP clock"))?;
-
-            if i == 0 || rtt < best_offset.rtt {
-                best_offset = PTPClockOffset {
-                    ptp_time,
-                    other_time: other_time + (rtt / 2),
-                    rtt
-                };
-            }
-        }
-
-        Ok(best_offset)
+        tightest_offset(&samples)
+            .ok_or_else(|| err_msg("The other clock went backwards in every read of the PTP clock"))
     }
 
     /// For older kernels that don't have 'ptp_sys_offset_extended2'
@@ -101,32 +84,44 @@ impl PTPDevice {
 
     /// Reads the other clock before and after the PTP clock, three times, and keeps the
     /// tightest of the three. Works with every driver, but the reads are separate syscalls, so
-    /// the window is wider than with 'ptp_sys_offset_extended2'.
+    /// the window is wider than with 'ptp_sys_offset_extended2'. A sample in which the other
+    /// clock went backwards (it was stepped between the reads) is skipped.
     pub fn offset_by_reads(&self, other_clock_id: sys::ClockId) -> Result<PTPClockOffset> {
-        let mut best_offset = PTPClockOffset {
-            ptp_time: Duration::ZERO,
-            other_time: Duration::ZERO,
-            rtt: Duration::ZERO
-        };
-        
-        for i in 0..3 {
-            let other_time = other_clock_id.get_time()?.into();
-            let ptp_time = self.get_time()?.into();
+        let mut samples = vec![];
+        for _ in 0..3 {
+            let other_time: Duration = other_clock_id.get_time()?.into();
+            let ptp_time: Duration = self.get_time()?.into();
             let other_time2: Duration = other_clock_id.get_time()?.into();
-            let rtt = other_time2.checked_sub(other_time)
-                .ok_or_else(|| err_msg("The other clock went backwards while reading the PTP clock"))?;
-
-            if i == 0 || rtt < best_offset.rtt {
-                best_offset = PTPClockOffset {
-                    ptp_time,
-                    other_time: other_time + (rtt / 2),
-                    rtt
-                };
-            }
+            samples.push((other_time, ptp_time, other_time2));
         }
 
-        Ok(best_offset)
+        tightest_offset(&samples)
+            .ok_or_else(|| err_msg("The other clock went backwards in every read of the PTP clock"))
     }
+}
+
+/// Of samples (other clock, PTP clock, other clock again), the one with the shortest window,
+/// as an offset taken at the window's midpoint. Samples in which the other clock went
+/// backwards are skipped; None if all did.
+fn tightest_offset(samples: &[(Duration, Duration, Duration)]) -> Option<PTPClockOffset> {
+    let mut best_offset: Option<PTPClockOffset> = None;
+
+    for (other_time, ptp_time, other_time2) in samples.iter().cloned() {
+        let rtt = match other_time2.checked_sub(other_time) {
+            Some(v) => v,
+            None => continue,
+        };
+
+        if best_offset.as_ref().map(|b| rtt < b.rtt).unwrap_or(true) {
+            best_offset = Some(PTPClockOffset {
+                ptp_time,
+                other_time: other_time + (rtt / 2),
+                rtt
+            });
+        }
+    }
+
+    best_offset
 }
 
 fn to_dur(t: &ptp_clock_time) -> Duration {
@@ -141,4 +136,29 @@ pub struct PTPClockOffset {
     pub other_time: Duration,
 
     pub rtt: Duration,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn us(v: u64) -> Duration {
+        Duration::from_micros(v)
+    }
+
+    #[test]
+    fn tightest_offset_skips_samples_where_the_clock_went_back() {
+        let samples = [
+            (us(1000), us(5000), us(1008)),
+            (us(2000), us(6000), us(1500)), // stepped back between the reads
+            (us(3000), us(7000), us(3004)),
+        ];
+
+        let best = tightest_offset(&samples).unwrap();
+        assert_eq!(best.rtt, us(4));
+        assert_eq!(best.other_time, us(3002));
+        assert_eq!(best.ptp_time, us(7000));
+
+        assert!(tightest_offset(&[(us(2000), us(6000), us(1500))]).is_none());
+    }
 }

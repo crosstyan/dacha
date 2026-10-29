@@ -1072,6 +1072,12 @@ impl MocapManagerInner {
                         entry.supervisor_stub.clone(),
                     )));
 
+                    // A camera that reconnects with a new endpoint keeps its bar as a failed
+                    // leader.
+                    if let Some(old_entry) = state.cameras.get(&camera_id) {
+                        entry.ptp_health.barred_until = old_entry.ptp_health.barred_until;
+                    }
+
                     state.cameras.insert(camera_id, entry);
                 }
 
