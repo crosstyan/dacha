@@ -40,6 +40,7 @@ use crate::skeleton::{SkeletonTracker, standard_skeleton};
 use crate::networking::*;
 use crate::aux_rpc_server::*;
 use crate::side_channel::*;
+use crate::ptp_leader::*;
 
 const CONFIG_PATCH_FILE: &'static str = "config.pb";
 
@@ -129,6 +130,9 @@ struct State {
 
     time_server_addr: String,
 
+    /// The camera that leads the PTP time sync, and since when (see ptp_leader.rs).
+    ptp_leader: Option<(u64, Instant)>,
+
     side_channel: Option<Arc<DataSideChannel>>,
 }
 
@@ -152,7 +156,7 @@ struct CameraEntry {
     camera_stub: Arc<CameraStub>,
 
     ptp_stub: Arc<TimeSyncStub>,
-    ptp_leader: bool,
+    ptp_health: PtpHealth,
 
     supervisor_stub: Option<Arc<SupervisorStub>>,
 
@@ -260,6 +264,7 @@ impl MocapManager {
         });
 
         resources.spawn_interruptable("resolver", MocapManagerInner::service_resolver_thread(shared.clone())).await;
+        resources.spawn_interruptable("ptp_leader", MocapManagerInner::ptp_leader_thread(shared.clone())).await;
         resources.spawn_interruptable("merger", MocapManagerInner::frame_merger_thread(shared.clone())).await;
         resources.spawn_interruptable("intrinsics_loader", MocapManagerInner::intrinsics_loader_thread(shared.clone())).await;
 
@@ -299,7 +304,7 @@ impl MocapManager {
                         rpc_addr: String::new(),
                         camera_stub,
                         ptp_stub,
-                        ptp_leader: false,
+                        ptp_health: PtpHealth::default(),
                         supervisor_stub: None,
                         task: Some(task),
                         status: None,
@@ -999,21 +1004,8 @@ impl MocapManagerInner {
             // TODO: Explicitly rate limit the resolving rate.
             let current_cameras = resolver.resolve().await?;
 
-            let mut enabled_cameras = HashSet::<u64, FastHasherBuilder>::default();
-            {
-                let config = shared.config.read().await?;
-                for c in config.per_camera() {
-                    if c.enabled() {
-                        enabled_cameras.insert(c.camera_id());
-                    }
-                }
-            }
-
             // Make sure all cameras have connections setup.
 
-            // TODO: Make sure that leader selection is deterministic assuming all cameras are present.
-
-            let mut have_ptp_leader = false;
             let mut new_cameras = vec![];
             lock!(state <= shared.state.lock().await?, {
 
@@ -1053,7 +1045,7 @@ impl MocapManagerInner {
                     ptp_addr: conn.ptp_addr,
                     ptp_stub: conn.ptp_stub,
                     camera_stub: conn.camera_stub,
-                    ptp_leader: false,
+                    ptp_health: PtpHealth::default(),
                     supervisor_stub: Some(supervisor_stub),
                     status: None,
                     pending_save_intrinsics: None,
@@ -1078,23 +1070,7 @@ impl MocapManagerInner {
                     state.cameras.insert(camera_id, entry);
                 }
 
-                let mut have_ptp_leader = false;
-                let mut first_enabled = None;
-                for (id, entry) in &mut state.cameras {
-                    let is_enabled = enabled_cameras.contains(id);
-                    entry.ptp_leader &= is_enabled;
-                    have_ptp_leader |= entry.ptp_leader;
-
-                    if is_enabled {
-                        first_enabled = Some(*id);
-                    }
-                }
-
-                if !have_ptp_leader {
-                    if let Some(id) = first_enabled {
-                        state.cameras.get_mut(&id).unwrap().ptp_leader = true;
-                    }
-                }
+                // NOTE: The PTP leader is chosen by ptp_leader_thread.
 
 
                 let mut s = NetworkingStatus::default();
@@ -1175,6 +1151,53 @@ impl MocapManagerInner {
     }
 
 
+    /// Global (per-manager) thread that chooses the camera that leads the PTP time sync, and
+    /// replaces it when it fails (see ptp_leader.rs). The per-camera status monitors push the
+    /// resulting configs to the cameras.
+    async fn ptp_leader_thread(shared: Arc<Shared>) -> Result<()> {
+        let settle_until = Instant::now() + STATUS_TIMEOUT;
+
+        loop {
+            executor::sleep(Duration::from_secs(1)).await?;
+
+            let config = shared.config.read().await?;
+
+            lock!(state <= shared.state.lock().await?, {
+                let now = Instant::now();
+
+                let decision = {
+                    let candidates = state.cameras.iter()
+                        .map(|(id, entry)| PtpCandidate {
+                            camera_id: *id,
+                            enabled: config.camera_enabled(*id),
+                            health: &entry.ptp_health,
+                        })
+                        .collect::<Vec<_>>();
+
+                    choose_ptp_leader(&candidates, state.ptp_leader, settle_until, now)
+                };
+
+                let name = |id: Option<u64>| {
+                    id.map(|id| entity_id_to_string(id).unwrap_or_else(|| id.to_string()))
+                        .unwrap_or_else(|| "none".to_string())
+                };
+
+                if let Some((id, failure)) = &decision.failed {
+                    eprintln!("[PTP] Leader {} failed: {:?}", name(Some(*id)), failure);
+                    if let Some(entry) = state.cameras.get_mut(id) {
+                        entry.ptp_health.barred_until = Some(now + FAILED_LEADER_BAR);
+                    }
+                }
+
+                let current = state.ptp_leader.map(|(id, _)| id);
+                if decision.leader != current {
+                    eprintln!("[PTP] Leader: {} -> {}", name(current), name(decision.leader));
+                    state.ptp_leader = decision.leader.map(|id| (id, now));
+                }
+            });
+        }
+    }
+
     // TODO: Need all the per-camera threads to use weak pointers.
 
     //// Per-camera thread
@@ -1239,6 +1262,25 @@ impl MocapManagerInner {
             };
 
             let intended_ptp_config = Self::get_ptp_config(&shared, camera_id).await?;
+
+            lock!(state <= shared.state.lock().await?, {
+                if let Some(entry) = state.cameras.get_mut(&camera_id) {
+                    let follower_sync_age = {
+                        if ptp_status.config().has_follower() && ptp_status.follower().got_sync() {
+                            Some(ptp_status.follower().last_sync_age())
+                        } else {
+                            None
+                        }
+                    };
+
+                    entry.ptp_health.record_status(
+                        now,
+                        *ptp_status.config() == intended_ptp_config,
+                        follower_sync_age
+                    );
+                }
+            });
+
             if *ptp_status.config() != intended_ptp_config {
                 // eprintln!("Configuring PTP for camera...");
 
@@ -1469,7 +1511,7 @@ impl MocapManagerInner {
 
             let template = ptp_core::default_config_template();
 
-            if entry.ptp_leader {
+            if state.ptp_leader.map(|(id, _)| id) == Some(camera_id) {
                 ptp_config.set_leader(template.leader().clone());
 
                 for (follower_camera_id, entry) in &state.cameras {
