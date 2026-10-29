@@ -78,6 +78,27 @@ struct FollowerState {
     last_sync: Option<LastSyncMetadata>,
     rtt_filter: Option<MinRttFilter>,
     num_queued_rounds: u64,
+    ignored: IgnoredRounds,
+}
+
+/// PTP packets a follower ignored because they did not come from its leader.
+#[derive(Default)]
+struct IgnoredRounds {
+    count: u64,
+    last_peer: Option<SocketAddr>,
+}
+
+impl IgnoredRounds {
+    /// Records one ignored packet from 'peer'. Returns whether to log it: the first one from
+    /// a peer (since the last ignored packet came from another), then every 100th, so that a
+    /// leader whose packets all leave from an unexpected address shows up in the log without
+    /// flooding it.
+    fn record(&mut self, peer: &SocketAddr) -> bool {
+        self.count += 1;
+        let new_peer = self.last_peer.as_ref() != Some(peer);
+        self.last_peer = Some(peer.clone());
+        new_peer || self.count % 100 == 0
+    }
 }
 
 struct SystemClockState {
@@ -205,6 +226,10 @@ impl TimeSyncNode {
                     proto.set_min_rtt(min_rtt as f64 * 1e-9);
                 }
                 proto.set_num_queued_rounds(follower_state.num_queued_rounds);
+                proto.set_num_ignored_rounds(follower_state.ignored.count);
+                if let Some(peer) = &follower_state.ignored.last_peer {
+                    proto.set_last_ignored_peer(peer.to_string());
+                }
             }
 
             // TODO: Dedup this with above.
@@ -883,6 +908,17 @@ impl TimeSyncNode {
                 if state.config.has_follower()
                     && !ptp_core::is_from_leader(state.config.follower(), &peer_addr)
                 {
+                    let leader = state.config.follower().leader_ptp_addr().to_string();
+                    if let Some(follower_state) = state.follower_state.as_mut() {
+                        if follower_state.ignored.record(&peer_addr) {
+                            eprintln!(
+                                "TimeSyncNode: ignored a PTP packet from {} (leader: {:?}); {} ignored so far",
+                                peer_addr.to_string(),
+                                leader,
+                                follower_state.ignored.count
+                            );
+                        }
+                    }
                     return Result::<_, Error>::Ok(());
                 }
 
@@ -1063,6 +1099,23 @@ mod tests {
         // error over the 100 s gap would add 5 ppm.
         let expected = config.p_scale() * error * 1e6;
         assert!((c.freq_ppm - expected).abs() < 1e-9, "{} ppm instead of {} ppm", c.freq_ppm, expected);
+    }
+
+    #[test]
+    fn ignored_rounds_are_counted_and_logged_sparingly() {
+        let a: SocketAddr = "10.0.0.5:319".parse().unwrap();
+        let b: SocketAddr = "10.0.0.6:319".parse().unwrap();
+        let mut ignored = IgnoredRounds::default();
+
+        // The first packet from a peer is logged, the next ones only every 100th.
+        let logged = (0..250).filter(|_| ignored.record(&a)).count();
+        assert_eq!(logged, 3, "logged {} of 250 packets from one peer", logged);
+        assert_eq!(ignored.count, 250);
+
+        // A packet from another peer is logged at once.
+        assert!(ignored.record(&b));
+        assert_eq!(ignored.count, 251);
+        assert_eq!(ignored.last_peer, Some(b));
     }
 
     #[test]

@@ -40,6 +40,10 @@ fn print_follower(name: &str, s: &FollowerStatus, rtt_window: bool) {
     if rtt_window {
         println!("  min_rtt_ns         {}", ns(s.min_rtt()));
         println!("  queued_rounds      {}", s.num_queued_rounds());
+        println!("  ignored_rounds     {}", s.num_ignored_rounds());
+        if !s.last_ignored_peer().is_empty() {
+            println!("  last_ignored_peer  {}", s.last_ignored_peer());
+        }
     }
 }
 

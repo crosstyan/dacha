@@ -199,6 +199,15 @@ message FollowerStatus {
 
     // Number of rounds skipped because their RTT was too far above min_rtt.
     uint64 num_queued_rounds = 6;
+
+    // Number of PTP packets ignored because they came from a peer other than
+    // FollowerConfig.leader_ptp_addr. A count that keeps growing while got_sync stays false
+    // means the leader's packets leave from another address than the one the manager knows
+    // (for example a second IPv4 address on the leader).
+    uint64 num_ignored_rounds = 7;
+
+    // Address of the last peer whose packet was ignored.
+    string last_ignored_peer = 8;
 }
 
 message ConfigureRequest {

@@ -21,6 +21,22 @@ Upgrade the cameras first:
   status, which is harmless: the manager then judges such a leader by its
   Status RPC only.
 
+## One IPv4 address per camera
+
+A follower takes rounds only from the address in `leader_ptp_addr`, which the
+manager builds from the leader's mDNS endpoint and port 319. The leader's PTP
+socket is bound to 0.0.0.0:319, so the kernel picks the source address from the
+route to each follower. With one IPv4 address per camera (the link-local setup
+in `pkg/vision/mocap/doc/networking.md`) the two are the same. A camera with a
+second address (a static or DHCP one beside the link-local one) can send from
+the other one; its followers then ignore every round. `ptp_status` shows this as
+a growing `ignored_rounds` with the address in `last_ignored_peer`, and the
+follower logs the first ignored packet and every 100th.
+
+`leader_ptp_addr` does not support IPv6: an IPv6 endpoint gives "ip:319"
+without brackets, which does not parse, and a follower with an address that
+does not parse ignores every round.
+
 
 ## Unsorted Notes
 
