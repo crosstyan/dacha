@@ -23,6 +23,10 @@ pub struct Updater {
 #[derive(Default)]
 struct Shared {
     update_lock: AsyncMutex<()>,
+
+    /// The file systems stay as they are: no remount read-write for an update
+    /// and read-only after it (boards whose root is always writable).
+    leave_fs_mounts: bool,
 }
 
 enum PendingOperation {
@@ -36,6 +40,16 @@ enum PendingOperation {
 }
 
 impl Updater {
+    /// An updater that never remounts the file systems.
+    pub fn leaving_fs_mounts() -> Self {
+        Self {
+            shared: Arc::new(Shared {
+                update_lock: AsyncMutex::default(),
+                leave_fs_mounts: true,
+            })
+        }
+    }
+
     // NOTE: If this fails, then likely there is a file still
     // open as writeable by some program.
     //
@@ -97,7 +111,9 @@ impl Updater {
         }
 
         // TODO: Always disable this if this future is dropped.
-        Self::toggle_writeable_fs(true)?;
+        if !shared.leave_fs_mounts {
+            Self::toggle_writeable_fs(true)?;
+        }
 
         let data_path = LocalPath::new("/opt/mocap/supervisor/update");
 
@@ -197,8 +213,10 @@ impl Updater {
         // Wait for any background cleanup of writeable file descriptors to finish. 
         executor::sleep(Duration::from_secs(1)).await?;
         
-        if let Err(e) = Self::toggle_writeable_fs(false) {
-            eprintln!("Failed to mark FS as read only: {}", e);
+        if !shared.leave_fs_mounts {
+            if let Err(e) = Self::toggle_writeable_fs(false) {
+                eprintln!("Failed to mark FS as read only: {}", e);
+            }
         }
 
         drop(update_lock);

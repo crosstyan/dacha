@@ -396,11 +396,12 @@ impl MocapCamera {
             // 
 
             // Frames from before the new sensor timing and config are in place
-            // must not get grid timestamps, so the trigger has to lock again.
+            // must not get grid timestamps, so the trigger has to lock again,
+            // from edges after the change (see below).
+            let retimed = config.frame_rate() != old_config.frame_rate() ||
+                config.exposure_micros() != old_config.exposure_micros();
             if let FrameTrigger::PtpPwm(trigger) = &shared.trigger {
-                if config.frame_rate() != old_config.frame_rate() ||
-                    config.exposure_micros() != old_config.exposure_micros()
-                {
+                if retimed {
                     trigger.restart_lock();
                 }
             }
@@ -478,6 +479,13 @@ impl MocapCamera {
                     lock!(c <= shared.config.lock().await?, {
                         *c = Arc::new(config);
                     });
+
+                    // The sensor ioctls above can take longer than the 32 edges
+                    // a lock needs, so the lock is dropped again now that
+                    // everything is in place.
+                    if retimed {
+                        trigger.restart_lock();
+                    }
 
                     return Ok(());
                 }
@@ -610,7 +618,7 @@ impl MocapCamera {
                 // and output_errors counts edges that never arrived.
                 let status = trigger.status();
                 let p = proto.pps_divider_telemetry_mut();
-                p.set_locked(status.locked);
+                p.set_locked(status.on_grid(frame_rate, Instant::now()));
                 p.set_prediction_error(status.last_error_secs());
                 p.set_output_errors(status.missed_edges.min(u32::MAX as u64) as u32);
                 None

@@ -186,10 +186,10 @@ async fn main() -> Result<()> {
             println!("networking iface {} healthy {} {}", n.iface_name(), n.healthy(), n.error());
             for c in s.cameras() {
                 let t = c.camera_status().pps_divider_telemetry();
+                // (The manager clears the sensor and the config in these statuses.)
                 println!(
-                    "camera {:016x} synced {} sensor {} trigger locked {} | ptp: {}",
-                    c.id(), c.synced(), c.camera_status().sensor().model_name(), t.locked(),
-                    ptp_summary(c.ptp_status())
+                    "camera {:016x} synced {} trigger locked {} | ptp: {}",
+                    c.id(), c.synced(), t.locked(), ptp_summary(c.ptp_status())
                 );
             }
         }

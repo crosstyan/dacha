@@ -6,7 +6,8 @@ extern crate macros;
 /*
 The manager without the cluster services and the UI: it finds the cameras,
 runs their time sync and merges their blobs, and serves mocap.Manager over
-plain HTTP/2 RPC.
+plain HTTP/2 RPC, without authentication (including Execute): for a
+development machine on a trusted network.
 
     MOCAP_CAMERA_IFACE=eno1 cargo run --bin mocap_manager_headless -- \
         --port=8000 --data_dir=/tmp/mocap_data_dir

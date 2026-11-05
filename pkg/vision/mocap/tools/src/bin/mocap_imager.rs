@@ -50,6 +50,10 @@ async fn main() -> Result<()> {
         println!("Assigned new camera id: {}", entity_id_to_string(id).unwrap());
     }
 
+    if hardware_config.soc_board() != SocBoard::NO_SOC_BOARD {
+        return Err(err_msg("The imager only writes Raspberry Pi images"));
+    }
+
     let inner_cmd = rpi_imager::WriteCommand {
         image: args.image,
         disk: args.disk,

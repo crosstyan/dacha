@@ -720,12 +720,10 @@ impl WandingCalibrationSolver {
         &self,
         camera_params: &mut [CameraParameters]
     ) -> Result<()> {
-        let mut up_vector = Vector3d::zero();
-        let mut num_cams = 0;
-
         let initial_system_state = self.initial_system_state.as_ref()
             .ok_or_else(|| err_msg("Missing initial system status"))?;
 
+        let mut gravity_samples = vec![];
         for cam in initial_system_state.cameras() {
             let cam_id = cam.id();
 
@@ -737,34 +735,32 @@ impl WandingCalibrationSolver {
                 continue;
             }
 
+            // Cameras without an accelerometer (e.g. the RV1126B) do not vote on
+            // which way is up.
+            if !cam.camera_status().accelerometer().has_value() {
+                continue;
+            }
+
             let extrinsics = &camera_params.iter().find(|p| p.id == cam_id)
                 .ok_or_else(|| err_msg("Camera not declared in system_state"))?
                 .extrinsics;
 
-            let r = from_axis_angle(&extrinsics.rotation);
-
-            if !cam.camera_status().accelerometer().has_value() {
-                return Err(err_msg("Camera missing accelerometer vector"));
-            }
-
             let proto = cam.camera_status().accelerometer().value();
-            let accel_vec = Vector3d::from_proto(proto)?;
-
-            let v: Vector3d = r.transpose() * accel_vec.normalized();
-            up_vector += v;
-            num_cams += 1;
+            gravity_samples.push((from_axis_angle(&extrinsics.rotation), Vector3d::from_proto(proto)?));
         }
 
-        up_vector /= (num_cams as f64);
-        up_vector.normalize();
-
-        
-        let r_align = {
-            let z = vec3d(0., 0., 1.);
-            let mut axis = up_vector.cross(&z).normalized();
-            let angle = up_vector.dot(&z).acos();
-            axis *= angle;
-            from_axis_angle(&axis)
+        let r_align = match up_vector_from_accelerometers(&gravity_samples) {
+            Some(up_vector) => {
+                let z = vec3d(0., 0., 1.);
+                let mut axis = up_vector.cross(&z).normalized();
+                let angle = up_vector.dot(&z).acos();
+                axis *= angle;
+                from_axis_angle(&axis)
+            }
+            None => {
+                eprintln!("[Calibration] No enabled camera has an accelerometer: the floor is not levelled until the origin is set.");
+                Matrix3d::identity()
+            }
         };
 
         let t_align = {
@@ -903,4 +899,43 @@ struct FrameCameraData {
     points_3d: Vec<Vector3d>,
 }
 
+/// Which way is up in the calibration frame: the mean of the cameras' measured
+/// gravity directions (each a camera rotation and an accelerometer reading in
+/// that camera's frame), or None if no camera has an accelerometer.
+fn up_vector_from_accelerometers(samples: &[(Matrix3d, Vector3d)]) -> Option<Vector3d> {
+    if samples.is_empty() {
+        return None;
+    }
 
+    let mut up_vector = Vector3d::zero();
+    for (r, accel_vec) in samples {
+        let v: Vector3d = r.transpose() * accel_vec.clone().normalized();
+        up_vector += v;
+    }
+
+    up_vector /= samples.len() as f64;
+    up_vector.normalize();
+    Some(up_vector)
+}
+
+#[cfg(test)]
+mod align_tests {
+    use super::*;
+
+    #[test]
+    fn up_vector_averages_the_cameras_that_have_an_accelerometer() {
+        assert!(up_vector_from_accelerometers(&[]).is_none());
+
+        // A camera level with the world and one rolled 90 degrees about x; both
+        // see 'up' as world +z.
+        let level = Matrix3d::identity();
+        let rolled = from_axis_angle(&vec3d(std::f64::consts::FRAC_PI_2, 0., 0.));
+        let samples = [
+            (level.clone(), vec3d(0., 0., 9.8)),
+            (rolled.clone(), &rolled * vec3d(0., 0., 1.)),
+        ];
+
+        let up = up_vector_from_accelerometers(&samples).unwrap();
+        assert!((up.clone() - vec3d(0., 0., 1.)).norm() < 1e-9, "{:?}", up);
+    }
+}

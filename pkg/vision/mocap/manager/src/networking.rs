@@ -180,9 +180,9 @@ impl CameraResolver {
 
         let mut ifaces = net_iface::NetworkInterface::list().await?;
 
-        // MOCAP_CAMERA_IFACE names the interface to use with the IPv4 address it
-        // already has, for a camera network that is not link-local (e.g. a
-        // development machine whose network config must not be changed).
+        // MOCAP_CAMERA_IFACE names the interface to use with the (first) IPv4
+        // address it already has, for a camera network that is not link-local
+        // (e.g. a development machine whose network config must not be changed).
         if let Ok(name) = std::env::var("MOCAP_CAMERA_IFACE") {
             for iface in &ifaces {
                 if iface.name != name {

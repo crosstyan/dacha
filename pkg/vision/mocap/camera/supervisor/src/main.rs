@@ -88,7 +88,8 @@ struct Args {
     hardware_config: String,
 
     /// Mount the root file system read only at start (the Pi image's
-    /// normal state; the updater makes it writeable while it works).
+    /// normal state; the updater makes it writeable while it works). With
+    /// false the supervisor never remounts anything, also not for updates.
     #[arg(default = true)]
     read_only_fs: bool,
 }
@@ -135,7 +136,7 @@ async fn main() -> Result<()> {
 
     let mut rpc_server = rpc::Http2Server::new(Some(81));
     let inst = Arc::new(SupervisorInst {
-        updater: Default::default(),
+        updater: if args.read_only_fs { Updater::default() } else { Updater::leaving_fs_mounts() },
         hardware_config
     });
     rpc_server.add_service(inst.clone().into_service())?;

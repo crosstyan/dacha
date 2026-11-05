@@ -453,6 +453,33 @@ struct State {
     status: TriggerStatus,
 }
 
+impl State {
+    /// restart_lock(): the status is unlocked from now on, and the loop drops
+    /// the servo's lock at its next step.
+    fn request_unlock(&mut self) {
+        self.unlock_requested = true;
+        self.status.locked = false;
+    }
+
+    /// The inputs of the next step; takes the unlock request.
+    fn take_step_inputs(&mut self) -> (u32, bool) {
+        let unlock = self.unlock_requested;
+        self.unlock_requested = false;
+        (self.requested_frame_rate, unlock)
+    }
+
+    /// Publishes the status after a step. A request that came during the step
+    /// keeps it unlocked: the lock is from before the request.
+    fn publish(&mut self, mut status: TriggerStatus, error: Option<String>, now: Instant) {
+        if self.unlock_requested {
+            status.locked = false;
+        }
+        status.error = error;
+        status.updated = Some(now);
+        self.status = status;
+    }
+}
+
 /// The trigger: a thread that runs the servo on the EXTTS events and writes
 /// the PWM. A frame rate of 0 holds the output low.
 pub struct PtpPwmTrigger {
@@ -498,9 +525,7 @@ impl PtpPwmTrigger {
     /// Drops the lock now, e.g. before the sensor timing changes: the frames
     /// count as off the grid until LOCK_EDGES good edges after this call.
     pub fn restart_lock(&self) {
-        let mut state = self.shared.state.lock().unwrap();
-        state.unlock_requested = true;
-        state.status.locked = false;
+        self.shared.state.lock().unwrap().request_unlock();
     }
 
     pub fn status(&self) -> TriggerStatus {
@@ -508,38 +533,28 @@ impl PtpPwmTrigger {
     }
 
     fn run<O: TriggerOutput, E: EdgeSource>(shared: Arc<Shared>, mut trigger_loop: TriggerLoop<O, E>) {
-        let mut last_error_log: Option<Instant> = None;
+        let mut last_error_log: Option<(Instant, String)> = None;
 
         while !shared.stop.load(Ordering::Relaxed) {
-            let (rate, unlock) = {
-                let mut state = shared.state.lock().unwrap();
-                let unlock = state.unlock_requested;
-                state.unlock_requested = false;
-                (state.requested_frame_rate, unlock)
-            };
+            let (rate, unlock) = shared.state.lock().unwrap().take_step_inputs();
 
             let res = trigger_loop.step(rate, unlock);
             if res.is_err() {
                 trigger_loop.servo.unlock();
             }
 
-            let mut state = shared.state.lock().unwrap();
-            let mut status = trigger_loop.status();
-            // A restart_lock() during the step must not be undone by the lock
-            // from before it.
-            if state.unlock_requested {
-                status.locked = false;
-            }
-            status.error = res.as_ref().err().map(|e| e.to_string());
-            status.updated = Some(Instant::now());
-            state.status = status;
-            drop(state);
+            let error = res.as_ref().err().map(|e| e.to_string());
+            shared.state.lock().unwrap().publish(trigger_loop.status(), error.clone(), Instant::now());
 
-            if let Err(e) = res {
+            if let Some(error) = error {
+                // The same error again is logged at most every ERROR_LOG_INTERVAL.
                 let now = Instant::now();
-                if last_error_log.map(|t| now - t >= ERROR_LOG_INTERVAL).unwrap_or(true) {
-                    eprintln!("[PtpPwmTrigger] {}", e);
-                    last_error_log = Some(now);
+                let repeat = last_error_log.as_ref()
+                    .map(|(t, e)| *e == error && now - *t < ERROR_LOG_INTERVAL)
+                    .unwrap_or(false);
+                if !repeat {
+                    eprintln!("[PtpPwmTrigger] {}", error);
+                    last_error_log = Some((now, error));
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -967,6 +982,33 @@ mod tests {
 
         status.updated = None;
         assert!(!status.on_grid(120, now));
+    }
+
+    #[test]
+    fn a_restart_request_unlocks_at_once_and_outlasts_a_step_running_during_it() {
+        let now = Instant::now();
+        let locked = TriggerStatus { frame_rate: 120, locked: true, ..Default::default() };
+
+        let mut state = State { requested_frame_rate: 120, ..Default::default() };
+        state.publish(locked.clone(), None, now);
+        assert!(state.status.locked);
+
+        // restart_lock(): unlocked before the loop has even seen it.
+        state.request_unlock();
+        assert!(!state.status.locked);
+
+        // A step that started before the request publishes its old lock: it
+        // stays unlocked.
+        state.publish(locked.clone(), None, now);
+        assert!(!state.status.locked);
+
+        // The next step takes the request (and drops the servo's lock).
+        assert_eq!(state.take_step_inputs(), (120, true));
+        assert_eq!(state.take_step_inputs(), (120, false));
+        state.publish(locked.clone(), Some("e".into()), now);
+        assert!(state.status.locked);
+        assert_eq!(state.status.error.as_deref(), Some("e"));
+        assert_eq!(state.status.updated, Some(now));
     }
 
     #[test]
