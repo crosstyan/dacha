@@ -702,8 +702,12 @@ mod tests {
     #[test]
     fn locks_at_low_frame_rates_with_a_large_rate_offset() {
         // At 24 fps a 150 ppm rate offset (crystal plus a PTP clock that is
-        // being slewed) leaves the proportional term alone 25 us off the grid.
-        for (frame_rate, rate_error) in [(24, 150e-6), (24, -150e-6), (60, 300e-6), (120, -500e-6)] {
+        // being slewed) leaves the proportional term alone 25 us off the grid,
+        // and 500 ppm 83 us: past the 42 us band of 120 fps, so a band that
+        // does not scale with the period never locks there.
+        for (frame_rate, rate_error) in [
+            (24, 150e-6), (24, -150e-6), (24, 500e-6), (24, -500e-6), (60, 300e-6), (120, -500e-6)
+        ] {
             let mut sim = Sim::new(frame_rate, START + 10_000_000.0, rate_error);
             let mut lock_edge = None;
             for i in 0..2000 {
@@ -714,7 +718,7 @@ mod tests {
                 }
             }
             let lock_edge = lock_edge.unwrap_or_else(|| panic!("{} fps, {}: never locked", frame_rate, rate_error));
-            assert!(lock_edge < 400, "{} fps, {}: locked after {} edges", frame_rate, rate_error, lock_edge);
+            assert!(lock_edge < 600, "{} fps, {}: locked after {} edges", frame_rate, rate_error, lock_edge);
         }
     }
 

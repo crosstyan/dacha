@@ -395,11 +395,13 @@ impl MocapCamera {
 
             // 
 
-            // Frames from before the new sensor timing and config are in place
-            // must not get grid timestamps, so the trigger has to lock again,
-            // from edges after the change (see below).
-            let retimed = config.frame_rate() != old_config.frame_rate() ||
-                config.exposure_micros() != old_config.exposure_micros();
+            // Frames from before the new frame rate and sensor timing are in
+            // place must not get grid timestamps, so the trigger has to lock
+            // again, from edges after the change (see below). An exposure
+            // change alone moves the estimated trigger time by less than half
+            // a period (the exposure limit is below it), so frames keep their
+            // grid points and blobs keep flowing.
+            let retimed = config.frame_rate() != old_config.frame_rate();
             if let FrameTrigger::PtpPwm(trigger) = &shared.trigger {
                 if retimed {
                     trigger.restart_lock();
@@ -566,9 +568,15 @@ impl MocapCamera {
             config.set_pixel_threshold(v.min(255).max(1));
         }
 
-        // A config sent without these (the manager replaces the whole config)
-        // has 0 for both: quality 0 divides by zero in the JPEG quantization
-        // tables, and a rate of 0 in the frame interval. They get the defaults.
+        // A config sent without a blob filter (the manager replaces the whole
+        // config) would reject every blob: max_area and the ratios are 0.
+        if !config.has_blob_filter() {
+            config.set_blob_filter(FrameProcessor::default_blob_filter_config()?);
+        }
+
+        // Without an mjpeg block quality and max_fps are 0: quality 0 divides
+        // by zero in the JPEG quantization tables, and a rate of 0 in the frame
+        // interval. They get the defaults.
         {
             let defaults = MJPEGEncoder::default_config()?;
             let mjpeg = config.mjpeg_mut();
@@ -826,6 +834,9 @@ mod tests {
         config.set_exposure_micros(5000u32);
         MocapCamera::validate_config(&mut config, &sensor).unwrap();
         assert_eq!(config.exposure_micros(), 5000);
+
+        // A missing blob filter gets the default.
+        assert_eq!(config.blob_filter(), &FrameProcessor::default_blob_filter_config().unwrap());
 
         // Missing MJPEG settings get the defaults; quality stays within 1..100.
         assert_eq!(config.mjpeg().quality(), 100);

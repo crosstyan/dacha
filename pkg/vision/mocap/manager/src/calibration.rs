@@ -923,19 +923,74 @@ mod align_tests {
     use super::*;
 
     #[test]
-    fn up_vector_averages_the_cameras_that_have_an_accelerometer() {
+    fn up_vector_is_the_mean_direction_of_the_rotated_readings() {
         assert!(up_vector_from_accelerometers(&[]).is_none());
 
-        // A camera level with the world and one rolled 90 degrees about x; both
-        // see 'up' as world +z.
+        // One camera level with the world, one rolled 90 degrees about x. Their
+        // readings, brought into the calibration frame, point 10 degrees either
+        // side of +z, with different magnitudes: only the mean of the
+        // normalized directions is +z.
+        let tilt = 10f64.to_radians();
         let level = Matrix3d::identity();
         let rolled = from_axis_angle(&vec3d(std::f64::consts::FRAC_PI_2, 0., 0.));
         let samples = [
-            (level.clone(), vec3d(0., 0., 9.8)),
-            (rolled.clone(), &rolled * vec3d(0., 0., 1.)),
+            (level.clone(), vec3d(0., tilt.sin(), tilt.cos()) * 9.8),
+            (rolled.clone(), &rolled * (vec3d(0., -tilt.sin(), tilt.cos()) * 1.0)),
         ];
 
         let up = up_vector_from_accelerometers(&samples).unwrap();
         assert!((up.clone() - vec3d(0., 0., 1.)).norm() < 1e-9, "{:?}", up);
+    }
+
+    fn camera(id: u64, x: f64) -> CameraParameters {
+        CameraParameters {
+            id,
+            intrinsics: CameraIntrinsicsModel::from_nominal_params(1280, 800, 3.6, 0.003),
+            extrinsics: CameraExtrinsics {
+                rotation: vec3d(0.1, 0.2, 0.0),
+                translation: vec3d(x, 0.5, 2.0),
+            },
+        }
+    }
+
+    /// A solver whose initial status has every given camera enabled, with an
+    /// accelerometer reading where one is given.
+    fn solver(cameras: &[(u64, Option<Vector3d>)]) -> WandingCalibrationSolver {
+        let mut status = MocapManagerStatus::default();
+        for (id, accel) in cameras {
+            let c = status.config_mut().new_per_camera();
+            c.set_camera_id(*id);
+            c.set_enabled(true);
+
+            let cam = status.new_cameras();
+            cam.set_id(*id);
+            if let Some(accel) = accel {
+                cam.camera_status_mut().accelerometer_mut().set_value(accel.to_proto());
+            }
+        }
+
+        let mut solver = WandingCalibrationSolver::new(MocapManagerConfig::default(), Default::default());
+        solver.set_initial_status(status);
+        solver
+    }
+
+    fn distance(params: &[CameraParameters]) -> f64 {
+        (params[0].extrinsics.position() - params[1].extrinsics.position()).norm()
+    }
+
+    #[test]
+    fn align_extrinsics_works_with_cameras_without_an_accelerometer() {
+        let g = &from_axis_angle(&vec3d(0.1, 0.2, 0.0)) * vec3d(0., 0., 9.8);
+
+        // One camera with an accelerometer and one without (an RV1126B).
+        let mut params = vec![camera(1, 0.0), camera(2, 1.5)];
+        let before = distance(&params);
+        solver(&[(1, Some(g.clone())), (2, None)]).align_extrinsics(&mut params).unwrap();
+        assert!((distance(&params) - before).abs() < 1e-9);
+
+        // None with one: the orientation is kept, the geometry too.
+        let mut params = vec![camera(1, 0.0), camera(2, 1.5)];
+        solver(&[(1, None), (2, None)]).align_extrinsics(&mut params).unwrap();
+        assert!((distance(&params) - before).abs() < 1e-9);
     }
 }
