@@ -558,6 +558,22 @@ impl MocapCamera {
             config.set_pixel_threshold(v.min(255).max(1));
         }
 
+        // A config sent without these (the manager replaces the whole config)
+        // has 0 for both: quality 0 divides by zero in the JPEG quantization
+        // tables, and a rate of 0 in the frame interval. They get the defaults.
+        {
+            let defaults = MJPEGEncoder::default_config()?;
+            let mjpeg = config.mjpeg_mut();
+            if mjpeg.quality() == 0 {
+                mjpeg.set_quality(defaults.quality());
+            }
+            let quality = mjpeg.quality().min(100);
+            mjpeg.set_quality(quality);
+            if mjpeg.max_fps() == 0 {
+                mjpeg.set_max_fps(defaults.max_fps());
+            }
+        }
+
         config.rgb_led_colors_mut().resize(NUM_RGB_LEDS, 0);
         
 
@@ -802,6 +818,13 @@ mod tests {
         config.set_exposure_micros(5000u32);
         MocapCamera::validate_config(&mut config, &sensor).unwrap();
         assert_eq!(config.exposure_micros(), 5000);
+
+        // Missing MJPEG settings get the defaults; quality stays within 1..100.
+        assert_eq!(config.mjpeg().quality(), 100);
+        assert_eq!(config.mjpeg().max_fps(), 5);
+        config.mjpeg_mut().set_quality(500u32);
+        MocapCamera::validate_config(&mut config, &sensor).unwrap();
+        assert_eq!(config.mjpeg().quality(), 100);
 
         // The AR0234 keeps the upstream limits.
         let mut config = MocapCameraConfigureRequest::default();
