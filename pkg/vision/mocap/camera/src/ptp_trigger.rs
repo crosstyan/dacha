@@ -45,10 +45,17 @@ const KI: f64 = 0.02;
 /// Limit of the frequency term (crystal tolerance plus the PTP correction).
 const MAX_FREQ: f64 = 1e-3;
 
-/// The frequency term only integrates errors this small. Larger ones are
-/// phase still being pulled in (where the output may also be limited); they
-/// would wind the term up to its limit and overshoot.
-const INTEGRATE_ERROR_NS: i64 = 20_000;
+/// The frequency term only integrates errors within this multiple of the
+/// largest error the proportional term alone leaves at a steady rate offset
+/// (MAX_FREQ * period / KP: 33 us at 120 fps, 167 us at 24 fps), so every
+/// allowed offset gets integrated. Larger errors are phase still being pulled
+/// in (where the output may also be limited); they would wind the term up.
+const INTEGRATE_BAND: f64 = 1.25;
+
+/// The most the frequency term moves per edge. It bounds the windup of an
+/// approach that starts integrating at the edge of the band, and still lets
+/// the term follow 2e-6 * frame_rate per second.
+const MAX_FREQ_STEP: f64 = 2e-6;
 
 /// The trigger counts as locked after this many edges in a row within
 /// LOCK_ERROR_NS of the grid, and as unlocked at the first edge further than
@@ -160,6 +167,11 @@ impl TriggerServo {
         self.freq
     }
 
+    /// Errors up to this size are integrated into the frequency term.
+    fn integrate_band_ns(&self) -> f64 {
+        INTEGRATE_BAND * MAX_FREQ * self.nominal_period_ns() / KP
+    }
+
     /// Takes the PTP clock time of a rising edge and returns the period to
     /// program next. Must not be called while the frame rate is 0.
     pub fn update(&mut self, edge: Duration) -> ServoStep {
@@ -199,8 +211,9 @@ impl TriggerServo {
         let correction = (period * self.freq - KP * (error_ns as f64))
             .clamp(-max_correction, max_correction);
 
-        if error_ns.abs() <= INTEGRATE_ERROR_NS {
-            self.freq = (self.freq - KI * (error_ns as f64) / period).clamp(-MAX_FREQ, MAX_FREQ);
+        if (error_ns.abs() as f64) <= self.integrate_band_ns() {
+            let step = (KI * (error_ns as f64) / period).clamp(-MAX_FREQ_STEP, MAX_FREQ_STEP);
+            self.freq = (self.freq - step).clamp(-MAX_FREQ, MAX_FREQ);
         }
 
         ServoStep {
@@ -672,6 +685,47 @@ mod tests {
     }
 
     #[test]
+    fn locks_at_low_frame_rates_with_a_large_rate_offset() {
+        // At 24 fps a 150 ppm rate offset (crystal plus a PTP clock that is
+        // being slewed) leaves the proportional term alone 25 us off the grid.
+        for (frame_rate, rate_error) in [(24, 150e-6), (24, -150e-6), (60, 300e-6), (120, -500e-6)] {
+            let mut sim = Sim::new(frame_rate, START + 10_000_000.0, rate_error);
+            let mut lock_edge = None;
+            for i in 0..2000 {
+                sim.edge();
+                if sim.servo.locked() {
+                    lock_edge = Some(i);
+                    break;
+                }
+            }
+            let lock_edge = lock_edge.unwrap_or_else(|| panic!("{} fps, {}: never locked", frame_rate, rate_error));
+            assert!(lock_edge < 400, "{} fps, {}: locked after {} edges", frame_rate, rate_error, lock_edge);
+        }
+    }
+
+    #[test]
+    fn pull_in_does_not_overshoot_at_any_frame_rate() {
+        // Once an approach gets within the unlock limit it stays there. At low
+        // frame rates the integration band is wide (208 us at 24 fps), so this
+        // relies on the frequency step limit.
+        for frame_rate in [24, 60, 120] {
+            let period = 1e9 / (frame_rate as f64);
+            let mut sim = Sim::new(frame_rate, START + 0.4 * period, 30e-6);
+            let mut near = false;
+            for i in 0..3000 {
+                sim.edge();
+                let e = sim.true_error_ns().abs();
+                if near {
+                    assert!(e <= UNLOCK_ERROR_NS, "{} fps, edge {}: {} ns", frame_rate, i, e);
+                } else if e <= UNLOCK_ERROR_NS {
+                    near = true;
+                }
+            }
+            assert!(near && sim.servo.locked(), "{} fps", frame_rate);
+        }
+    }
+
+    #[test]
     fn never_moves_a_period_more_than_the_limit() {
         let mut sim = Sim::new(120, START + 4_000_000.0, 0.0);
         let nominal = sim.servo.nominal_period_ns();
@@ -703,7 +757,7 @@ mod tests {
         // While the phase is pulled in the frequency term holds exactly.
         for _ in 0..16 {
             sim.edge();
-            assert!(sim.true_error_ns().abs() > INTEGRATE_ERROR_NS);
+            assert!((sim.true_error_ns().abs() as f64) > sim.servo.integrate_band_ns());
             assert_eq!(sim.servo.freq(), freq);
         }
 
