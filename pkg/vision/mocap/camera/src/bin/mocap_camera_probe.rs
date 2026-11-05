@@ -10,6 +10,14 @@ Talks to one camera's mocap.Camera service directly, without the manager.
     mocap_camera_probe --addr=192.168.2.222:82 --command=configure --config="frame_rate: 120 exposure_micros: 500"
     mocap_camera_probe --addr=192.168.2.222:82 --command=blobs --count=1200
     mocap_camera_probe --addr=192.168.2.222:82 --command=frame --out=frame.jpg
+    mocap_camera_probe --addr=127.0.0.1:8000 --command=manager_status
+
+    mocap_camera_probe --addr=127.0.0.1:8000 --command=manager_execute \
+        --config="set_camera_enabled { camera_id: 4509193066563315283 enabled: true }"
+
+'manager_status' asks a manager (mocap.Manager) instead and prints one line
+per camera: its time sync role and errors. 'manager_execute' sends the
+manager an ExecuteRequest given as a text proto (what the UI's buttons do).
 
 'configure' merges the given text proto into the camera's current config.
 'blobs' prints a summary of the frame timestamps it received: their spacing
@@ -45,6 +53,42 @@ async fn status(stub: &CameraStub) -> Result<MocapCameraStatus> {
         .await
         .map_err(|_| err_msg("No Status answer within 5 s"))?
         .result
+}
+
+fn ns(seconds: f64) -> String {
+    format!("{}", (seconds * 1e9).round())
+}
+
+/// The manager clears the leader and follower configs in the statuses it
+/// returns, so the roles come from which status parts are present.
+fn ptp_summary(s: &ptp_proto::ptp::StatusResponse) -> String {
+    let config = s.config();
+    let mut parts = vec![];
+    if config.has_leader() || s.has_leader() {
+        let mut v = format!("leader of {}", s.leader().followers().len());
+        for f in s.leader().followers() {
+            v += &format!(" [{} fails {}/{} in a row]", f.rpc_addr(), f.num_failures(), f.num_consecutive_failures());
+        }
+        parts.push(v);
+    }
+    if config.has_follower() || s.has_follower() {
+        let f = s.follower();
+        parts.push(format!(
+            "follower err_ns {} rtt_ns {} age {:.2}",
+            ns(f.last_leader_error()), ns(f.last_leader_rtt()), f.last_sync_age()
+        ));
+    }
+    if config.has_basic_client() || s.has_basic_client() {
+        let b = s.basic_client();
+        parts.push(format!(
+            "time server err_ns {} age {:.2}",
+            ns(b.last_leader_error()), b.last_sync_age()
+        ));
+    }
+    if parts.is_empty() {
+        parts.push("not configured".into());
+    }
+    parts.join(", ")
 }
 
 fn frame_interval_ns(frame_rate: u32) -> u64 {
@@ -133,6 +177,33 @@ async fn main() -> Result<()> {
 
             std::fs::write(&args.out, res.mjpeg())?;
             println!("Wrote {} bytes to {}", res.mjpeg().len(), args.out);
+        }
+        "manager_status" => {
+            let channel = Arc::new(rpc::Http2Channel::create(format!("http://{}", args.addr).as_str()).await?);
+            let stub = ManagerStub::new(channel);
+            let s = executor::timeout(Duration::from_secs(5), stub.Status(&ctx, &MocapManagerStatusRequest::default()))
+                .await
+                .map_err(|_| err_msg("No Status answer within 5 s"))?
+                .result?;
+
+            let n = s.networking();
+            println!("networking iface {} healthy {} {}", n.iface_name(), n.healthy(), n.error());
+            for c in s.cameras() {
+                let t = c.camera_status().pps_divider_telemetry();
+                println!(
+                    "camera {:016x} synced {} sensor {} trigger locked {} | ptp: {}",
+                    c.id(), c.synced(), c.camera_status().sensor().model_name(), t.locked(),
+                    ptp_summary(c.ptp_status())
+                );
+            }
+        }
+        "manager_execute" => {
+            let channel = Arc::new(rpc::Http2Channel::create(format!("http://{}", args.addr).as_str()).await?);
+            let stub = ManagerStub::new(channel);
+            let mut req = ExecuteRequest::default();
+            protobuf::text::parse_text_proto(&args.config, &mut req)?;
+            stub.Execute(&ctx, &req).await.result?;
+            println!("ok");
         }
         other => {
             return Err(format_err!("Unknown command: {}", other));

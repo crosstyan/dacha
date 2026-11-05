@@ -10,6 +10,7 @@ pub mod strobe;
 mod inst;
 mod sensors;
 mod dummy;
+mod no_sensor;
 mod timestamp;
 mod capture;
 mod capture_dequeue;
@@ -17,3 +18,4 @@ pub mod ptp_trigger;
 
 pub use inst::*;
 pub use dummy::*;
+pub use no_sensor::*;

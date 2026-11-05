@@ -122,6 +122,11 @@ struct Args {
     #[arg(default = false)]
     dummy: bool,
 
+    /// Real time sync, but a camera service with no sensor (it never sends
+    /// frames), for a board whose sensor is missing.
+    #[arg(default = false)]
+    no_sensor: bool,
+
     // Mainly here to make sure something is explicitly picked.
     mode: Mode,
 }
@@ -202,9 +207,14 @@ async fn main() -> Result<()> {
         service.register_dependency(time_sync.clone()).await;
         server.add_service(time_sync.clone().into_service())?;
 
-        let cam = Arc::new(MocapCamera::create(hardware_config.clone(), ptp_device.clone()).await?);
-        service.register_dependency(cam.clone()).await;
-        server.add_service(cam.clone().into_service())?;
+        if args.no_sensor {
+            let cam = Arc::new(mocap_camera::NoSensorMocapCamera::new((**hardware_config).clone()));
+            server.add_service(cam.into_service())?;
+        } else {
+            let cam = Arc::new(MocapCamera::create(hardware_config.clone(), ptp_device.clone()).await?);
+            service.register_dependency(cam.clone()).await;
+            server.add_service(cam.clone().into_service())?;
+        }
         
         // server.add_request_handler("/camera", true, CameraHttpHandler { inst: cam.clone() })?;
     }

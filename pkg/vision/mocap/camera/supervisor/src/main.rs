@@ -81,12 +81,31 @@ impl SupervisorService for SupervisorInst {
 
 
 // TODO: Probably just limit this to one thread.
+#[derive(Args)]
+struct Args {
+    /// Binary CameraHardwareConfig, or text if the name ends in ".txtpb".
+    #[arg(default = "/boot/firmware/camera_hardware.pb")]
+    hardware_config: String,
+
+    /// Mount the root file system read only at start (the Pi image's
+    /// normal state; the updater makes it writeable while it works).
+    #[arg(default = true)]
+    read_only_fs: bool,
+}
+
 #[executor_main]
 async fn main() -> Result<()> {
+    let args = common::args::parse_args::<Args>()?;
 
     let hardware_config = {
-        let data = file::read("/boot/firmware/camera_hardware.pb").await?;
-        CameraHardwareConfig::parse(&data)?
+        if args.hardware_config.ends_with(".txtpb") {
+            let mut proto = CameraHardwareConfig::default();
+            protobuf::text::parse_text_proto(&file::read_to_string(&args.hardware_config).await?, &mut proto)?;
+            proto
+        } else {
+            let data = file::read(&args.hardware_config).await?;
+            CameraHardwareConfig::parse(&data)?
+        }
     };
 
     let camera_id = {
@@ -99,8 +118,10 @@ async fn main() -> Result<()> {
     println!("Camera Id: {}", camera_id);
 
     // Normalize initial state which may be wrong if the supervisor restarted mid update.
-    if let Err(e) = Updater::toggle_writeable_fs(false) {
-        eprintln!("Failed to mark FS as read only: {}", e);
+    if args.read_only_fs {
+        if let Err(e) = Updater::toggle_writeable_fs(false) {
+            eprintln!("Failed to mark FS as read only: {}", e);
+        }
     }
 
     // TODO: Call gethostname/sethostname, set /etc/hostname, etc.
