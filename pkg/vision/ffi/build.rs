@@ -8,8 +8,13 @@ fn main() {
 
     // On systems without a system wide install of Eigen (e.g. Windows), it is
     // expected to be in //ext/eigen3 (see pkg/vision/mocap/app/build_windows.ps1).
+    // EIGEN3_INCLUDE_DIR overrides both, e.g. when cross compiling with a
+    // toolchain that refuses host paths such as /usr/include.
+    println!("cargo:rerun-if-env-changed=EIGEN3_INCLUDE_DIR");
     let mut eigen_dir = PathBuf::from("/usr/include/eigen3");
-    if !eigen_dir.exists() {
+    if let Ok(dir) = env::var("EIGEN3_INCLUDE_DIR") {
+        eigen_dir = PathBuf::from(dir);
+    } else if !eigen_dir.exists() {
         eigen_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../../ext/eigen3");
     }
 
