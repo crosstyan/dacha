@@ -9,6 +9,9 @@ impl ClockId {
 
     pub const MONOTONIC: Self = Self(bindings::CLOCK_MONOTONIC as i32);
 
+    /// Like MONOTONIC but it also counts time spent in suspend.
+    pub const BOOTTIME: Self = Self(bindings::CLOCK_BOOTTIME as i32);
+
     // TODO: Consider making this unsafe as we don't know if the file is still open.
     pub fn from_fd(fd: c_int) -> Self {
         let v = (!fd) << 3 | CLOCKFD;
