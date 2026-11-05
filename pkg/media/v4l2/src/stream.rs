@@ -293,6 +293,19 @@ impl<B: Buffer> Stream<B> {
     /// TODO: Require '&mut self' for this (TODO: Instead allow splitting
     /// streams in half)
     pub async fn dequeue_buffer(&self) -> Result<B> {
+        let (buffer, corrupted) = self.dequeue_buffer_allow_errors().await?;
+        if corrupted {
+            // NOTE: The buffer is dropped here, so it is never queued again.
+            return Err(err_msg("V4L2 buffer returned with corrupted data"));
+        }
+
+        Ok(buffer)
+    }
+
+    /// Like dequeue_buffer() but also returns buffers that the driver marked
+    /// with V4L2_BUF_FLAG_ERROR, with 'true' as the second value, so that the
+    /// caller can queue them again.
+    pub async fn dequeue_buffer_allow_errors(&self) -> Result<(B, bool)> {
         // NOTE: This must be pinned as we make a reference to it below.
         let mut planes = vec![];
         planes.reserve_exact(self.num_planes);
@@ -330,13 +343,9 @@ impl<B: Buffer> Stream<B> {
             planes,
         };
 
-        // TODO: Only consider this if we care about reading the contents of the buffer
-        // (or feeding it as an input to a stream that will read from it).
-        if raw.buffer.flags & V4L2_BUF_FLAG_ERROR != 0 {
-            return Err(err_msg("V4L2 buffer returned with corrupted data"));
-        }
+        let corrupted = raw.buffer.flags & V4L2_BUF_FLAG_ERROR != 0;
 
-        Ok(unsafe { B::from_raw_parts(raw, data) })
+        Ok((unsafe { B::from_raw_parts(raw, data) }, corrupted))
     }
 
     /// NOTE: This should always execute quickly without much blocking.

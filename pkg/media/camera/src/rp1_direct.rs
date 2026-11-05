@@ -27,7 +27,8 @@ const SETTINGS: &'static [CameraSettings] = &[
 ];
 
 
-/// Direct camera access on Raspberry Pis that use the RP1 chip.
+/// Direct camera access on Raspberry Pis that use the RP1 chip, on older Pis
+/// (unicam) and on Rockchip SoCs with the vendor rkcif (VICAP) driver.
 ///
 /// Currently this hardcodes configuring monochrome cameras at max resolution. 
 ///
@@ -57,6 +58,12 @@ struct CameraSettings {
 
 impl RP1DirectCamera {
     pub async fn open() -> Result<Self> {
+        Self::open_sensor(None).await
+    }
+
+    /// Like open() but, if sensor_name is given, only uses a sensor whose media
+    /// entity name contains it (e.g. "ov9281" for "m00_b_ov9281 4-0060").
+    pub async fn open_sensor(sensor_name: Option<&str>) -> Result<Self> {
         let mut video_devs = {
             let mut out = HashMap::new();
             for dev in v4l2::Device::list().await? {
@@ -82,7 +89,9 @@ impl RP1DirectCamera {
             let entities = media_dev.list_entities()?;
 
             for entity in &entities {
-                if entity.typ() == v4l2::MediaEntityType::V4L2_SUBDEV_SENSOR {
+                if entity.typ() == v4l2::MediaEntityType::V4L2_SUBDEV_SENSOR &&
+                    sensor_name.map(|n| entity.name().map(|v| v.contains(n)).unwrap_or(false)).unwrap_or(true)
+                {
                     let entity_id = entity.id();
                     println!("Found camera entity '{}' (id {}) on '{}'", entity.name()?, entity_id, media_dev.path().as_str());
                     selected = Some((media_dev, entities, entity_id));
@@ -271,6 +280,44 @@ impl RP1DirectCamera {
                     .ok_or_else(|| err_msg("Missing video device"))?;
 
                 output_video
+            } else if media_driver == "rkcif" {
+                // Rockchip VICAP (vendor rkcif): sensor -> rockchip-mipi-csi2 ->
+                // stream_cif_mipi_id0, all linked by the driver. rkcif takes the bus
+                // format from the sensor at stream on, so only the sensor pad and
+                // the video node need a format.
+                let output_id = *entity_names.get("stream_cif_mipi_id0")
+                    .ok_or_else(|| err_msg("Failed to find the stream_cif_mipi_id0 entity"))?;
+
+                let output_entity = entities_by_id.get(&output_id).unwrap();
+
+                // Links are listed on their source entity.
+                let mut linked = false;
+                for entity in entities_by_id.values() {
+                    for l in entity.links() {
+                        if l.sink().entity_id() == output_id && l.flags().contains(v4l2::MediaLinkFlags::Enabled) {
+                            linked = true;
+                        }
+                    }
+                }
+                if !linked {
+                    return Err(err_msg("stream_cif_mipi_id0 has no enabled input link"));
+                }
+
+                println!("Configuring formats...");
+
+                let camera_source_pad = 0;
+                camera_subdev.set_format(camera_source_pad, &subdev_format).await?;
+
+                let fmt = camera_subdev.format(camera_source_pad).await?;
+                if fmt.format.code != settings.subdev_format_code {
+                    return Err(format_err!(
+                        "The sensor did not take bus format 0x{:x} (has 0x{:x})",
+                        settings.subdev_format_code, fmt.format.code
+                    ));
+                }
+
+                video_devs.remove(&output_entity.device_num().unwrap())
+                    .ok_or_else(|| err_msg("Missing video device"))?
             } else {
                 return Err(format_err!("Unsupported camera media driver: {}", media_driver))
             }

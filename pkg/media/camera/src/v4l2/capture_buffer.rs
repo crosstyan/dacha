@@ -13,7 +13,16 @@ struct Shared {
 
 impl CaptureDMABuffer {
     pub fn allocate(buffer_size: usize, count: usize) -> Result<Vec<CaptureDMABuffer>> {
-        let mut dma_heap = sys::DMAHeap::open_contiguous()?;
+        Self::allocate_from_heap("/dev/dma_heap/linux,cma", buffer_size, count)
+    }
+
+    /// Like allocate() but from the given DMA heap (a /dev/dma_heap/ path).
+    pub fn allocate_from_heap(
+        heap_path: &str,
+        buffer_size: usize,
+        count: usize,
+    ) -> Result<Vec<CaptureDMABuffer>> {
+        let mut dma_heap = sys::DMAHeap::open(heap_path)?;
 
         let mut out = vec![];
 

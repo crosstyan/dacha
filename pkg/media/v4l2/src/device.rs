@@ -82,7 +82,15 @@ impl Device {
 
             let path = LocalPath::new("/dev").join(entry.name());
 
-            out.push(Self::open(path).await?);
+            match Self::open(&path).await {
+                Ok(dev) => out.push(dev),
+                // Vendor nodes such as Rockchip's rkvpss-offline are named
+                // videoN but are not V4L2 devices: they refuse VIDIOC_QUERYCAP.
+                Err(e) if e.downcast_ref::<Errno>() == Some(&Errno::ENOTTY) => {
+                    eprintln!("[v4l2] Skipping {}: not a V4L2 device", path.as_str());
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         // TODO: Sort by the number.
