@@ -180,6 +180,30 @@ impl CameraResolver {
 
         let mut ifaces = net_iface::NetworkInterface::list().await?;
 
+        // MOCAP_CAMERA_IFACE names the interface to use with the IPv4 address it
+        // already has, for a camera network that is not link-local (e.g. a
+        // development machine whose network config must not be changed).
+        if let Ok(name) = std::env::var("MOCAP_CAMERA_IFACE") {
+            for iface in &ifaces {
+                if iface.name != name {
+                    continue;
+                }
+
+                for addrs in &iface.addrs {
+                    if let net_iface::NetworkInterfaceAddr::IP(ip @ net::ip::IPAddress::V4(_)) = &addrs.addr {
+                        return Ok((NetworkInterfaceRoute {
+                            name: iface.name.clone(),
+                            addr: ip.clone(),
+                            index: iface.index
+                        },
+                        iface.description.clone()));
+                    }
+                }
+            }
+
+            return Err(format_err!("MOCAP_CAMERA_IFACE: no interface '{}' with an IPv4 address", name));
+        }
+
         ifaces.retain(|i| {
             match i.typ {
                 net_iface::NetworkInterfaceType::PhysicalEthernet => true,
