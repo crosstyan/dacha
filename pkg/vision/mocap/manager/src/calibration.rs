@@ -980,13 +980,19 @@ mod align_tests {
 
     #[test]
     fn align_extrinsics_works_with_cameras_without_an_accelerometer() {
-        let g = &from_axis_angle(&vec3d(0.1, 0.2, 0.0)) * vec3d(0., 0., 9.8);
+        // Camera 1 sees gravity 20 degrees off the calibration frame's +z.
+        let r1 = from_axis_angle(&vec3d(0.1, 0.2, 0.0));
+        let tilt = 20f64.to_radians();
+        let g = &r1 * (vec3d(tilt.sin(), 0., tilt.cos()) * 9.8);
 
-        // One camera with an accelerometer and one without (an RV1126B).
+        // One camera with an accelerometer and one without (an RV1126B): the
+        // floor is levelled from camera 1 alone.
         let mut params = vec![camera(1, 0.0), camera(2, 1.5)];
         let before = distance(&params);
         solver(&[(1, Some(g.clone())), (2, None)]).align_extrinsics(&mut params).unwrap();
         assert!((distance(&params) - before).abs() < 1e-9);
+        let up = from_axis_angle(&params[0].extrinsics.rotation).transpose() * g.clone().normalized();
+        assert!((up.clone() - vec3d(0., 0., 1.)).norm() < 1e-6, "{:?}", up);
 
         // None with one: the orientation is kept, the geometry too.
         let mut params = vec![camera(1, 0.0), camera(2, 1.5)];

@@ -569,8 +569,9 @@ impl MocapCamera {
         }
 
         // A config sent without a blob filter (the manager replaces the whole
-        // config) would reject every blob: max_area and the ratios are 0.
-        if !config.has_blob_filter() {
+        // config), or with an empty one, would reject every blob: max_area and
+        // the ratios are 0.
+        if !config.has_blob_filter() || config.blob_filter().max_area() == 0 {
             config.set_blob_filter(FrameProcessor::default_blob_filter_config()?);
         }
 
@@ -835,7 +836,10 @@ mod tests {
         MocapCamera::validate_config(&mut config, &sensor).unwrap();
         assert_eq!(config.exposure_micros(), 5000);
 
-        // A missing blob filter gets the default.
+        // A missing blob filter gets the default, and so does an empty one.
+        assert_eq!(config.blob_filter(), &FrameProcessor::default_blob_filter_config().unwrap());
+        config.set_blob_filter(BlobFilterConfig::default());
+        MocapCamera::validate_config(&mut config, &sensor).unwrap();
         assert_eq!(config.blob_filter(), &FrameProcessor::default_blob_filter_config().unwrap());
 
         // Missing MJPEG settings get the defaults; quality stays within 1..100.

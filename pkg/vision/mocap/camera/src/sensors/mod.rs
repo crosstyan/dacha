@@ -42,3 +42,29 @@ impl SensorDriver {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// configure_inner() does not relock the trigger on an exposure change
+    /// alone: the estimated trigger time (frame start minus the time from the
+    /// edge) moves with the exposure, so every allowed change must stay below
+    /// half a frame interval, with room for the other errors (under 50 us).
+    #[test]
+    fn an_exposure_change_moves_the_trigger_estimate_less_than_half_a_period() {
+        let driver = OV9281Driver::new(192e6, 1456.0);
+        let sensor = SensorDriver::OV9281(driver.clone());
+
+        for frame_rate in 24..=sensor.max_frame_rate() {
+            let shortest = driver.trigger_to_frame_start(sensor.min_exposure_micros());
+            let longest = driver.trigger_to_frame_start(sensor.max_exposure_micros(frame_rate));
+            let half_period = std::time::Duration::from_nanos(1_000_000_000 / (frame_rate as u64) / 2);
+
+            assert!(
+                longest - shortest + std::time::Duration::from_micros(100) < half_period,
+                "{} fps: {:?} vs {:?}", frame_rate, longest - shortest, half_period
+            );
+        }
+    }
+}
