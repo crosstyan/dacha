@@ -30,7 +30,8 @@ const HEIGHT_ROWS: f64 = 800.0;
 /// The driver's minimum VBLANK.
 const MIN_VBLANK: u32 = 110;
 
-/// Free-running frames are made this many rows longer than the trigger period.
+/// Free-running frames are made this many rows longer than the longest
+/// trigger period (the nominal one plus the servo's MAX_PERIOD_CORRECTION).
 const VBLANK_MARGIN_ROWS: f64 = 15.0;
 
 /// Rows from the end of integration to the end of the readout, plus the 19
@@ -79,9 +80,12 @@ impl OV9281Driver {
         1e9 / (Self::effective_frame_rate(frame_rate) as f64) / self.row_ns
     }
 
-    /// VBLANK that makes the free-running frame slightly longer than the period.
+    /// VBLANK that makes the free-running frame slightly longer than the
+    /// longest period the trigger servo makes while it pulls in the phase. A
+    /// longer frame is fine; one shorter than the period gives extra frames.
     pub fn vblank_for_frame_rate(&self, frame_rate: u32) -> u32 {
-        let rows = (self.period_rows(frame_rate) + VBLANK_MARGIN_ROWS - HEIGHT_ROWS).ceil();
+        let longest_period_rows = self.period_rows(frame_rate) * (1.0 + MAX_PERIOD_CORRECTION);
+        let rows = (longest_period_rows + VBLANK_MARGIN_ROWS - HEIGHT_ROWS).ceil();
         (rows.max(0.0) as u32).max(MIN_VBLANK)
     }
 
@@ -118,8 +122,10 @@ mod tests {
         let d = y8();
         assert_eq!(d.row_time(), Duration::from_nanos(7583));
 
-        // 8333333 ns / 7583.3 ns = 1098.9 rows; + 15 - 800, rounded up.
-        assert_eq!(d.vblank_for_frame_rate(120), 314);
+        // 8333333 ns / 7583.3 ns = 1098.9 rows; * 1.015 + 15 - 800, rounded up.
+        assert_eq!(d.vblank_for_frame_rate(120), 331);
+        // At 24 fps the 1.5 % is 82 rows.
+        assert_eq!(d.vblank_for_frame_rate(24), 4792);
 
         // 1098.9 * 0.985 - 833 = 249 rows = 1888 us.
         assert_eq!(d.max_exposure_micros(120), 1888);

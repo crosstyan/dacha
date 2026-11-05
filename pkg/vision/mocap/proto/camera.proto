@@ -22,6 +22,21 @@ message CameraHardwareConfig {
 
     // 'Factory' calibrated intrinsics that are stored on the camera.
     vision.CameraIntrinsicsModelProto factory_intrinsics = 4;
+
+    // Set for a board that is not a Raspberry Pi compute module (compute_module
+    // is then UNKNOWN_CM). It is a field of its own rather than a
+    // ComputeModuleModel value so that builds which predate it skip it: an
+    // unknown enum value makes the whole message fail to parse.
+    SocBoard soc_board = 5;
+}
+
+enum SocBoard {
+    NO_SOC_BOARD = 0;
+
+    // XYLink XiaoYu IPC50 (Rockchip RV1126B) with the OV9281 on rkcif. No MCU:
+    // the frame trigger is a SoC PWM locked to the PTP clock through the
+    // GMAC's timestamp input (EXTTS).
+    ROCKCHIP_RV1126B = 1;
 }
 
 enum ComputeModuleModel {
@@ -30,11 +45,6 @@ enum ComputeModuleModel {
     PI_CM4_LITE = 2;
     PI_CM5 = 3;
     PI_CM5_LITE = 4;
-
-    // XYLink XiaoYu IPC50 (Rockchip RV1126B) with the OV9281 on rkcif. No MCU:
-    // the frame trigger is a SoC PWM locked to the PTP clock through the
-    // GMAC's timestamp input (EXTTS).
-    ROCKCHIP_RV1126B = 5;
 }
 
 // WARNING: Always prefer to use the mocap.Manager methods instead of these.

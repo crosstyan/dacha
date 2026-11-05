@@ -91,8 +91,7 @@ impl FrameTiming for OV9281FrameTiming {
     }
 
     fn frames_on_grid(&self, config: &MocapCameraConfigureRequest) -> bool {
-        let status = self.trigger.status();
-        status.locked && status.frame_rate == config.frame_rate()
+        self.trigger.status().on_grid(config.frame_rate(), Instant::now())
     }
 }
 
@@ -180,9 +179,9 @@ impl MocapCamera {
         ptp_device: Arc<ptp::PTPDevice>
     ) -> Result<Self> {
         let trigger = match hardware_config.trigger_pwm() {
-            Some((chip, channel)) => {
+            Some((pwm_device, channel)) => {
                 // EXTTS channel 0 is the input the PWM is looped back to.
-                FrameTrigger::PtpPwm(Arc::new(PtpPwmTrigger::create("/dev/ptp0", 0, chip, channel)?))
+                FrameTrigger::PtpPwm(Arc::new(PtpPwmTrigger::create("/dev/ptp0", 0, pwm_device, channel)?))
             }
             None => {
                 // Note that will reset the MCU immediately so it will be back in sync with the default
@@ -202,6 +201,10 @@ impl MocapCamera {
         #[cfg(feature = "rpi_pio")]
         if hardware_config.enable_pio_trigger_forwarder() {
             pio_forwarder = Some(PIO::create_pin_forwarder(16, 22)?);
+        }
+        #[cfg(not(feature = "rpi_pio"))]
+        if hardware_config.enable_pio_trigger_forwarder() {
+            return Err(err_msg("This camera needs the PIO trigger forwarder: build with the rpi_pio feature"));
         }
         
         let mut rgb_leds = None;
@@ -392,6 +395,16 @@ impl MocapCamera {
 
             // 
 
+            // Frames from before the new sensor timing and config are in place
+            // must not get grid timestamps, so the trigger has to lock again.
+            if let FrameTrigger::PtpPwm(trigger) = &shared.trigger {
+                if config.frame_rate() != old_config.frame_rate() ||
+                    config.exposure_micros() != old_config.exposure_micros()
+                {
+                    trigger.restart_lock();
+                }
+            }
+
             // The frame length must cover the trigger period, and it bounds the
             // exposure, so it goes first.
             if let SensorDriver::OV9281(driver) = &shared.sensor {
@@ -554,6 +567,10 @@ impl MocapCamera {
     pub async fn status(&self) -> Result<MocapCameraStatus> {
         let mut proto = MocapCameraStatus::default();
 
+        let frame_rate = lock!(config <= self.shared.config.lock().await?, {
+            config.frame_rate()
+        });
+
         proto.set_hardware_config((&**self.shared.hardware_config).clone());
 
         {
@@ -563,7 +580,8 @@ impl MocapCamera {
             p.set_frame_height(self.shared.camera_sensor.height);
             p.set_max_frame_rate(self.shared.sensor.max_frame_rate());
             p.set_min_exposure_micros(self.shared.sensor.min_exposure_micros());
-            p.set_max_exposure_micros(self.shared.sensor.max_exposure_micros(self.shared.sensor.max_frame_rate()));
+            // The limit at the current frame rate (the most at the slowest).
+            p.set_max_exposure_micros(self.shared.sensor.max_exposure_micros(frame_rate));
         }
 
         proto.set_camera_controls(self.shared.user_controls_prop.clone());

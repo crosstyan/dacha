@@ -1,4 +1,4 @@
-use mocap_proto::mocap::{CameraHardwareConfig, ComputeModuleModel};
+use mocap_proto::mocap::{CameraHardwareConfig, ComputeModuleModel, SocBoard};
 
 
 pub struct CameraHardwareConfigContainer {
@@ -15,22 +15,17 @@ impl CameraHardwareConfigContainer {
     }
 
     pub fn is_rv1126b(&self) -> bool {
-        self.config.compute_module() == ComputeModuleModel::ROCKCHIP_RV1126B
+        self.config.soc_board() == SocBoard::ROCKCHIP_RV1126B
     }
 
-    /// Whether frames are triggered by the PPS divider MCU. Otherwise a SoC PWM
-    /// makes the trigger (see trigger_pwm()).
-    pub fn has_pps_divider_mcu(&self) -> bool {
-        !self.is_rv1126b()
-    }
-
-    /// sysfs PWM (chip, channel) that drives the sensor's trigger input and is
-    /// looped back into the PTP clock's timestamp input (EXTTS channel 0).
-    pub fn trigger_pwm(&self) -> Option<(usize, usize)> {
+    /// PWM (controller platform device, channel) that drives the sensor's
+    /// trigger input and is looped back into the PTP clock's timestamp input
+    /// (EXTTS channel 0). None: the PPS divider MCU makes the trigger.
+    pub fn trigger_pwm(&self) -> Option<(&'static str, usize)> {
         if self.is_rv1126b() {
             // PWM1_CH2_M2 on GPIO6_A2 (CON3 pin 4) to the OV9281 FSIN and to
             // ETH_PPSTRIG_M0 on GPIO6_A0.
-            return Some((1, 0));
+            return Some(("20720000.pwm", 0));
         }
 
         None

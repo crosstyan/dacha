@@ -215,7 +215,7 @@ impl DequeueCaptureProcessor {
             })?;
 
             if free {
-                if let Err(e) = processing_sender.try_send(Frame { sequence, sof_time, buf }) {
+                if processing_sender.try_send(Frame { sequence, sof_time, buf }).is_err() {
                     return Err(err_msg("The blob processing threads have stopped"));
                 }
             } else {

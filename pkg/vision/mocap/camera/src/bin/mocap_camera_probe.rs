@@ -21,7 +21,9 @@ manager an ExecuteRequest given as a text proto (what the UI's buttons do).
 
 'configure' merges the given text proto into the camera's current config.
 'blobs' prints a summary of the frame timestamps it received: their spacing
-and their distance from the frame grid of the camera's frame rate.
+in frame intervals. (The camera rounds every timestamp to the grid, so only
+the spacing shows anything: a frame given the wrong grid point shows up as
+a gap of 0 or 2.)
 */
 
 use std::sync::Arc;
@@ -126,7 +128,6 @@ async fn main() -> Result<()> {
             let mut n = 0;
             let mut last_ts: Option<u64> = None;
             let mut gaps = std::collections::BTreeMap::<u64, usize>::new();
-            let mut off_grid = 0;
             let mut blob_counts = std::collections::BTreeMap::<usize, usize>::new();
 
             while n < args.count {
@@ -137,10 +138,6 @@ async fn main() -> Result<()> {
                 };
 
                 let ts = res.frame_timestamp();
-                // The grid is k * (1e9 / frame_rate) ns within each second.
-                if (ts % 1_000_000_000) % interval != 0 {
-                    off_grid += 1;
-                }
                 if let Some(last) = last_ts {
                     *gaps.entry((ts.saturating_sub(last) + interval / 2) / interval).or_default() += 1;
                 }
@@ -164,7 +161,6 @@ async fn main() -> Result<()> {
 
             let secs = start.elapsed().as_secs_f64();
             println!("{} responses in {:.2} s ({:.1}/s) at frame_rate {}", n, secs, (n as f64) / secs, frame_rate);
-            println!("timestamps off the grid: {}", off_grid);
             println!("gaps in frame intervals (intervals: count): {:?}", gaps);
             println!("blobs per frame (blobs: count): {:?}", blob_counts);
         }
