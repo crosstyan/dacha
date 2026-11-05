@@ -60,6 +60,9 @@ async fn main() -> Result<()> {
             },
             ComputeModuleModel::PI_CM5 => rpi_imager::HardwareModel::Cm5Regular,
             ComputeModuleModel::PI_CM5_LITE => rpi_imager::HardwareModel::Cm5Lite,
+            ComputeModuleModel::ROCKCHIP_RV1126B => {
+                return Err(err_msg("The imager only writes Raspberry Pi images"));
+            }
         }),
         config_txt_patch_file: Some(project_path!("pkg/vision/mocap/config/camera_config_patch.txt")),
         generate_first_boot: true,

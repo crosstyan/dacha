@@ -12,6 +12,8 @@ mod sensors;
 mod dummy;
 mod timestamp;
 mod capture;
+mod capture_dequeue;
+pub mod ptp_trigger;
 
 pub use inst::*;
 pub use dummy::*;

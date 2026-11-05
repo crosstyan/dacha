@@ -17,6 +17,7 @@ use mocap_proto::mocap::{CameraIntoService, CameraHardwareConfig};
 use mocap_camera::MocapCamera;
 use mocap_camera_core::CameraHardwareConfigContainer;
 use protobuf::StaticMessage;
+use net::route::NetworkInterfaceRoute;
 
 /*
 
@@ -84,6 +85,32 @@ impl http::ServerHandler for CameraHttpHandler {
 
 
 
+/// Route for binding to an interface by name. The address is left as 0.0.0.0.
+fn interface_route(name: &str) -> Result<NetworkInterfaceRoute> {
+    let index = std::fs::read_to_string(format!("/sys/class/net/{}/ifindex", name))?
+        .trim()
+        .parse()?;
+
+    Ok(NetworkInterfaceRoute {
+        name: name.to_string(),
+        addr: "0.0.0.0".parse()?,
+        index,
+    })
+}
+
+/// Reads a CameraHardwareConfig: text format if the path ends in ".txtpb",
+/// otherwise binary.
+async fn read_hardware_config(path: &LocalPathBuf) -> Result<CameraHardwareConfig> {
+    if path.as_str().ends_with(".txtpb") {
+        let mut proto = CameraHardwareConfig::default();
+        protobuf::text::parse_text_proto(&file::read_to_string(path).await?, &mut proto)?;
+        return Ok(proto);
+    }
+
+    let data = file::read(path).await?;
+    Ok(CameraHardwareConfig::parse(&data)?)
+}
+
 #[derive(Args)]
 struct Args {
     rpc_port: NamedPortArg,
@@ -145,8 +172,7 @@ async fn main() -> Result<()> {
         // TODO: Validate that the CPU we are running on matches the 'compute_module' entry
         // listed in here.
         let hardware_config: Arc<CameraHardwareConfigContainer> = {
-            let data = file::read(&args.hardware_config).await?;
-            let proto = CameraHardwareConfig::parse(&data)?;
+            let proto = read_hardware_config(&args.hardware_config).await?;
             Arc::new(CameraHardwareConfigContainer::new(proto))
         };
 
@@ -154,9 +180,10 @@ async fn main() -> Result<()> {
 
         // TODO: Need to ensure that the device matches the interface.
         let mut ptp_device = Arc::new(ptp::PTPDevice::open_default()?);
-        // TODO: Should be conditional on whether it is expected to be available.
-        ptp_device.configure_pps_output()
-            .map_err(|e| format_err!("While enabling PPS output: {}", e))?;
+        if hardware_config.has_ptp_pps_output() {
+            ptp_device.configure_pps_output()
+                .map_err(|e| format_err!("While enabling PPS output: {}", e))?;
+        }
 
         // TODO: Use the interface bind address.
         let ptp_socket = ptp::TimestampedUdpSocket::create(
@@ -164,7 +191,10 @@ async fn main() -> Result<()> {
             &hardware_config.ptp_interface()
         ).await?;
 
-        let basic_node = ptp_core::BasicTimeNode::create("0.0.0.0:400".parse()?, &hardware_config.ptp_interface()).await?;
+        let basic_node = ptp_core::BasicTimeNode::create(
+            "0.0.0.0:400".parse()?,
+            interface_route(&hardware_config.ptp_interface())?
+        ).await?;
 
         // TODO: Implement an offset if we are using CM5 / Pi 5
         let time_sync = Arc::new(ptp::TimeSyncNode::create(/* client.clone(), */ ptp_device.clone(), ptp_socket, Arc::new(basic_node)).await);

@@ -26,7 +26,7 @@ protobuf = { path = "../../../protobuf" }
 protobuf_json = { path = "../../../protobuf/json" }
 rpc = { path = "../../../rpc" }
 rpi = { path = "../../../rpi" }
-pio_rp1 = { path = "../../../rpi/pio_rp1" }
+pio_rp1 = { path = "../../../rpi/pio_rp1", optional = true }
 ptp = { path = "../../../net/ptp" }
 ptp_core = { path = "../../../net/ptp/core" }
 ptp_proto = { path = "../../../net/ptp/proto" }
@@ -42,3 +42,10 @@ electronics = { path = "../../../peripherals/electronics" }
 vision = { path = "../../" }
 flasher_swd = { path = "../../../peripherals/flasher/swd" }
 mocap_camera_core = { path = "./core" }
+
+[features]
+default = ["rpi_pio"]
+# The Raspberry Pi 5 PIO trigger forwarder (compute board revisions < 4). Its
+# bindings need the third_party/rpi/utils submodule; build without it for
+# other boards (--no-default-features).
+rpi_pio = ["dep:pio_rp1"]

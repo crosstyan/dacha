@@ -30,6 +30,11 @@ enum ComputeModuleModel {
     PI_CM4_LITE = 2;
     PI_CM5 = 3;
     PI_CM5_LITE = 4;
+
+    // XYLink XiaoYu IPC50 (Rockchip RV1126B) with the OV9281 on rkcif. No MCU:
+    // the frame trigger is a SoC PWM locked to the PTP clock through the
+    // GMAC's timestamp input (EXTTS).
+    ROCKCHIP_RV1126B = 5;
 }
 
 // WARNING: Always prefer to use the mocap.Manager methods instead of these.

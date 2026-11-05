@@ -4,6 +4,7 @@ use std::time::{Instant, Duration};
 
 use common::bytes::Bytes;
 use common::errors::*;
+#[cfg(feature = "rpi_pio")]
 use pio_rp1::PIO;
 use rpi::ws2812::WS2812SPIController;
 use peripherals::pwm::*;
@@ -33,6 +34,8 @@ use crate::accelerometer::*;
 use crate::timestamp::*;
 use crate::strobe::*;
 use crate::capture::*;
+use crate::capture_dequeue::*;
+use crate::ptp_trigger::*;
 
 // TODO: Dedup this constant.
 const STROBE_DIMMING_FREQUENCY: f32 = 10000.0;
@@ -40,10 +43,64 @@ const STROBE_DIMMING_FREQUENCY: f32 = 10000.0;
 // Currently the MCU models the entire strip as one color.
 const NUM_RGB_LEDS: usize = 1;
 
+/// Pixel rate of the camera-module ov9281 driver in Y8 (its PIXEL_RATE is a
+/// 64-bit control, which VIDIOC_QUERYCTRL does not report).
+const OV9281_Y8_PIXEL_RATE: f64 = 192e6;
+
+/// What makes the frame trigger pulses.
+enum FrameTrigger {
+    /// The PPS divider MCU on the Raspberry Pi camera boards.
+    PPSDivider(PPSDividerClient),
+
+    /// A SoC PWM locked to the PTP clock (RV1126B).
+    PtpPwm(Arc<PtpPwmTrigger>),
+}
+
+enum CaptureProcessor {
+    /// Pipelined processing on FRAME_SYNC events (RP1).
+    FrameSync(Arc<MocapCameraCaptureProcessor>),
+
+    /// Processing after each frame is dequeued (rkcif).
+    Dequeue(Arc<DequeueCaptureProcessor>),
+}
+
+impl CaptureProcessor {
+    fn blob_subscribers(&self) -> &BroadcastChannel<ReadBlobsResponse> {
+        match self {
+            CaptureProcessor::FrameSync(p) => p.blob_subscribers(),
+            CaptureProcessor::Dequeue(p) => p.blob_subscribers(),
+        }
+    }
+
+    fn mjpeg_subscribers(&self) -> &BroadcastChannel<Bytes> {
+        match self {
+            CaptureProcessor::FrameSync(p) => p.mjpeg_subscribers(),
+            CaptureProcessor::Dequeue(p) => p.mjpeg_subscribers(),
+        }
+    }
+}
+
+struct OV9281FrameTiming {
+    driver: OV9281Driver,
+    trigger: Arc<PtpPwmTrigger>,
+}
+
+impl FrameTiming for OV9281FrameTiming {
+    fn trigger_to_frame_start(&self, config: &MocapCameraConfigureRequest) -> Duration {
+        self.driver.trigger_to_frame_start(config.exposure_micros())
+    }
+
+    fn frames_on_grid(&self, config: &MocapCameraConfigureRequest) -> bool {
+        let status = self.trigger.status();
+        status.locked && status.frame_rate == config.frame_rate()
+    }
+}
+
 
 pub struct MocapCamera {
     resources: ServiceResourceGroup,
 
+    #[cfg(feature = "rpi_pio")]
     pio_forwarder: Option<PIO>,
 
     shared: Arc<Shared>,
@@ -63,7 +120,9 @@ struct Shared {
 
     user_controls_prop: media_camera_proto::media::camera::Property,
 
-    pps_divider_client: PPSDividerClient,
+    sensor: SensorDriver,
+
+    trigger: FrameTrigger,
 
     /// This state is locked while we are reading the status of the camera.
     status_state: AsyncMutex<StatusState>,
@@ -81,7 +140,7 @@ struct Shared {
 
     mono_time_sync: Arc<MonotonicClockTimeSyncer>,
 
-    capture_processor: Arc<MocapCameraCaptureProcessor>,
+    capture_processor: CaptureProcessor,
 }
 
 #[derive(Clone)]
@@ -120,9 +179,17 @@ impl MocapCamera {
         hardware_config: Arc<CameraHardwareConfigContainer>,
         ptp_device: Arc<ptp::PTPDevice>
     ) -> Result<Self> {
-        // Note that will reset the MCU immediately so it will be back in sync with the default
-        // config on the host side.
-        let pps_divider_client = PPSDividerClient::create(hardware_config.clone()).await?;
+        let trigger = match hardware_config.trigger_pwm() {
+            Some((chip, channel)) => {
+                // EXTTS channel 0 is the input the PWM is looped back to.
+                FrameTrigger::PtpPwm(Arc::new(PtpPwmTrigger::create("/dev/ptp0", 0, chip, channel)?))
+            }
+            None => {
+                // Note that will reset the MCU immediately so it will be back in sync with the default
+                // config on the host side.
+                FrameTrigger::PPSDivider(PPSDividerClient::create(hardware_config.clone()).await?)
+            }
+        };
 
         let mut strobe_dimming = None;
         if hardware_config.local_strobe_dimming() {
@@ -130,7 +197,9 @@ impl MocapCamera {
             strobe_dimming.as_mut().unwrap().write(STROBE_DIMMING_FREQUENCY, 0.0).await?;
         }
 
+        #[cfg(feature = "rpi_pio")]
         let mut pio_forwarder = None;
+        #[cfg(feature = "rpi_pio")]
         if hardware_config.enable_pio_trigger_forwarder() {
             pio_forwarder = Some(PIO::create_pin_forwarder(16, 22)?);
         }
@@ -140,15 +209,18 @@ impl MocapCamera {
             rgb_leds = Some(WS2812SPIController::create("/dev/spidev0.0")?);
         }
 
-        println!("Setup accelerometer...");
+        let mut accelerometer = None;
+        if hardware_config.has_accelerometer() {
+            println!("Setup accelerometer...");
 
-        let mut i2c_bus = I2CHostController::open(&hardware_config.accelerometer_i2c_device())?;
-        let accelerometer = Some(create_accelerometer(i2c_bus.device(0x19)).await?);
+            let mut i2c_bus = I2CHostController::open(&hardware_config.accelerometer_i2c_device())?;
+            accelerometer = Some(create_accelerometer(i2c_bus.device(0x19)).await?);
 
-        println!("Accelerometer good");
+            println!("Accelerometer good");
+        }
 
         // TODO: Have all key controls like exposure and analog/digital gains exported to a config file that we can re-initialize everything on boot.
-        let mut cam = RP1DirectCamera::open().await?;
+        let mut cam = RP1DirectCamera::open_sensor(hardware_config.camera_sensor_name()).await?;
 
         let v4l2_controls = cam.camera_subdev.list_controls().await?;
 
@@ -163,12 +235,34 @@ impl MocapCamera {
             v4l2::V4L2_CID_TEST_PATTERN_GREENR,
             v4l2::V4L2_CID_TEST_PATTERN_BLUE,
             v4l2::V4L2_CID_TEST_PATTERN_GREENB,
+            // Set from the frame rate (OV9281 frame sync).
+            OV9281_TRIGGER_MODE_CID,
         ];
 
         let user_controls = v4l2_controls.iter().cloned().filter(|control| {
             !reserved_controls.contains(&control.id()) &&
             !control.flags().contains(v4l2::ControlFlags::READ_ONLY)
         }).collect::<Vec<_>>();
+
+        let sensor = match &trigger {
+            FrameTrigger::PPSDivider(_) => SensorDriver::AR0234(AR0234Driver::default()),
+            FrameTrigger::PtpPwm(_) => {
+                let hblank = v4l2_controls.iter().find(|c| c.id() == v4l2::V4L2_CID_HBLANK)
+                    .ok_or_else(|| err_msg("The sensor has no HBLANK control"))?;
+                let hblank = cam.camera_subdev.get_control_value(hblank).await?;
+
+                let driver = OV9281Driver::new(OV9281_Y8_PIXEL_RATE, (cam.width as f64) + (hblank as f64));
+                println!("OV9281 row time: {:?}", driver.row_time());
+
+                // Frame sync takes effect at stream on, so it is set before the
+                // capture starts. Without trigger pulses the sensor free-runs.
+                let trigger_mode = v4l2_controls.iter().find(|c| c.id() == OV9281_TRIGGER_MODE_CID)
+                    .ok_or_else(|| err_msg("The sensor has no trigger_mode control"))?;
+                cam.camera_subdev.set_control_value(trigger_mode, OV9281_TRIGGER_FRAME_SYNC).await?;
+
+                SensorDriver::OV9281(driver)
+            }
+        };
 
         let resources = ServiceResourceGroup::new("MocapCamera");
 
@@ -187,7 +281,7 @@ impl MocapCamera {
             &user_controls, &cam.camera_subdev, "",
             &mut user_controls_prop, initial_config.camera_controls_mut()
         ).await?;
-        Self::validate_config(&mut initial_config)?;
+        Self::validate_config(&mut initial_config, &sensor)?;
 
         let config = Arc::new(AsyncMutex::new(Arc::new(initial_config)));
 
@@ -197,18 +291,36 @@ impl MocapCamera {
             height: cam.height,
         };
 
-        let capture_processor = Arc::new(MocapCameraCaptureProcessor::create(
-            config.clone(),
-            camera_sensor.clone(),
-            cam.capture_device,
-            cam.capture_stream,
-            mono_time_sync.clone()
-        ).await?);
-        resources.register_dependency(capture_processor.clone()).await;
+        let capture_processor = match (&trigger, &sensor) {
+            (FrameTrigger::PtpPwm(trigger), SensorDriver::OV9281(driver)) => {
+                let p = Arc::new(DequeueCaptureProcessor::create(
+                    config.clone(),
+                    camera_sensor.clone(),
+                    cam.capture_stream,
+                    mono_time_sync.clone(),
+                    Arc::new(OV9281FrameTiming { driver: driver.clone(), trigger: trigger.clone() }),
+                    hardware_config.frame_buffer_dma_heap(),
+                ).await?);
+                resources.register_dependency(p.clone()).await;
+                CaptureProcessor::Dequeue(p)
+            }
+            _ => {
+                let p = Arc::new(MocapCameraCaptureProcessor::create(
+                    config.clone(),
+                    camera_sensor.clone(),
+                    cam.capture_device,
+                    cam.capture_stream,
+                    mono_time_sync.clone()
+                ).await?);
+                resources.register_dependency(p.clone()).await;
+                CaptureProcessor::FrameSync(p)
+            }
+        };
 
         let shared = Arc::new(Shared {
             hardware_config,
-            pps_divider_client,
+            sensor,
+            trigger,
             camera_sensor,
             v4l2_controls,
             user_controls,
@@ -232,6 +344,7 @@ impl MocapCamera {
 
         Ok(Self {
             resources,
+            #[cfg(feature = "rpi_pio")]
             pio_forwarder,
             shared
         })
@@ -239,10 +352,12 @@ impl MocapCamera {
 
     pub async fn configure(&self, config: &MocapCameraConfigureRequest) -> Result<()> {
         let mut config = config.clone();
-        Self::validate_config(&mut config)?;
+        Self::validate_config(&mut config, &self.shared.sensor)?;
 
-        if self.shared.pps_divider_client.last_heartbeat().await?.is_none() {
-            return Err(err_msg("PPS divider not yet healthy"));
+        if let FrameTrigger::PPSDivider(client) = &self.shared.trigger {
+            if client.last_heartbeat().await?.is_none() {
+                return Err(err_msg("PPS divider not yet healthy"));
+            }
         }
 
         executor::spawn(Self::configure_inner(self.shared.clone(), config)).join().await
@@ -277,7 +392,17 @@ impl MocapCamera {
 
             // 
 
-            let driver = AR0234Driver::default();
+            // The frame length must cover the trigger period, and it bounds the
+            // exposure, so it goes first.
+            if let SensorDriver::OV9281(driver) = &shared.sensor {
+                let controls = configure_state.camera_subdev.list_controls().await?;
+                let vblank = controls.iter().find(|c| c.id() == v4l2::V4L2_CID_VBLANK)
+                    .ok_or_else(|| err_msg("Couldn't find the vblank control"))?;
+                configure_state.camera_subdev.set_control_value(
+                    vblank,
+                    driver.vblank_for_frame_rate(config.frame_rate()) as i32
+                ).await?;
+            }
 
             // TODO: Exposure only needs to be controlled via v4l2 for some sensors.
             {
@@ -295,7 +420,7 @@ impl MocapCamera {
                     .ok_or_else(|| err_msg("Couldn't find the exposure control"))?;
 
     
-                let exposure_value = driver.exposure_time_to_value(config.exposure_micros());
+                let exposure_value = shared.sensor.exposure_time_to_value(config.exposure_micros());
 
                 configure_state.camera_subdev.set_control_value(
                     &exposure_control,
@@ -332,6 +457,21 @@ impl MocapCamera {
 
             // TODO: Use better than microsecond precision for the exposure here.
 
+            let pps_divider_client = match &shared.trigger {
+                FrameTrigger::PPSDivider(client) => client,
+                FrameTrigger::PtpPwm(trigger) => {
+                    trigger.configure(config.frame_rate());
+
+                    lock!(c <= shared.config.lock().await?, {
+                        *c = Arc::new(config);
+                    });
+
+                    return Ok(());
+                }
+            };
+
+            let driver = AR0234Driver::default();
+
             let pps_config = PPSDividerConfigRequest {
                 unlock: false,
                 pulse_rate: config.frame_rate() as u8,
@@ -347,7 +487,7 @@ impl MocapCamera {
                 rgb_color: config.rgb_led_colors()[0]
             };
             if pps_config != configure_state.last_pps_config {
-                shared.pps_divider_client.configure(&pps_config).await?;
+                pps_divider_client.configure(&pps_config).await?;
                 configure_state.last_pps_config = pps_config;
             }
 
@@ -359,7 +499,7 @@ impl MocapCamera {
         })
     }
 
-    fn validate_config(config: &mut MocapCameraConfigureRequest) -> Result<()> {
+    fn validate_config(config: &mut MocapCameraConfigureRequest, sensor: &SensorDriver) -> Result<()> {
 
         if config.frame_rate() == 0 {
             // config.set_strobe_power(0.0);
@@ -370,16 +510,16 @@ impl MocapCamera {
                 config.set_frame_rate(24u32);
             }
 
-            // Must be slightly less than the max FPS of the sensor to avoid it missing a frame if the previous frame
-            // is still in progress.
-            if config.frame_rate() > 119 {
-                config.set_frame_rate(119u32);
+            if config.frame_rate() > sensor.max_frame_rate() {
+                config.set_frame_rate(sensor.max_frame_rate());
             }
         }
 
         {
             let v = config.exposure_micros();
-            config.set_exposure_micros(v.min(6000).max(20));
+            config.set_exposure_micros(
+                v.min(sensor.max_exposure_micros(config.frame_rate())).max(sensor.min_exposure_micros())
+            );
         }
 
         {
@@ -421,42 +561,30 @@ impl MocapCamera {
             p.set_model_name(&self.shared.camera_sensor.model_name);
             p.set_frame_width(self.shared.camera_sensor.width);
             p.set_frame_height(self.shared.camera_sensor.height);
-            p.set_max_frame_rate(119u32);
-            p.set_min_exposure_micros(20u32);
-            p.set_max_exposure_micros(6000u32);
+            p.set_max_frame_rate(self.shared.sensor.max_frame_rate());
+            p.set_min_exposure_micros(self.shared.sensor.min_exposure_micros());
+            p.set_max_exposure_micros(self.shared.sensor.max_exposure_micros(self.shared.sensor.max_frame_rate()));
         }
 
         proto.set_camera_controls(self.shared.user_controls_prop.clone());
 
-        if let Some((pkt, time)) = self.shared.pps_divider_client.last_heartbeat().await? {
-            let now = Instant::now();
-
-            let p = proto.pps_divider_heartbeat_mut();
-            p.set_mcu_temperature(pkt.temp_c);
-            p.set_vcc_voltage_min(pkt.vcc_min_v);
-            p.set_vcc_voltage_max(pkt.vcc_max_v);
-
-            fn get_poe_voltage(v: f32) -> f32 {
-                electronics::undivide_voltage(
-                    v,
-                    24.9,
-                    1.0
-                )
+        let pps_divider_client = match &self.shared.trigger {
+            FrameTrigger::PPSDivider(client) => Some(client),
+            FrameTrigger::PtpPwm(trigger) => {
+                // The trigger's lock to the PTP clock in the MCU's fields:
+                // prediction_error is the last edge's distance from the frame grid
+                // and output_errors counts edges that never arrived.
+                let status = trigger.status();
+                let p = proto.pps_divider_telemetry_mut();
+                p.set_locked(status.locked);
+                p.set_prediction_error(status.last_error_secs());
+                p.set_output_errors(status.missed_edges.min(u32::MAX as u64) as u32);
+                None
             }
+        };
 
-            p.set_poe_voltage_min(get_poe_voltage(pkt.poe_min_v));
-            p.set_poe_voltage_max(get_poe_voltage(pkt.poe_max_v));
-        }
-
-        if let Some((pkt, time)) = self.shared.pps_divider_client.last_telemetry().await? {
-
-            let p = proto.pps_divider_telemetry_mut();
-            p.set_locked(self.shared.pps_divider_client.is_locked().await?);
-
-            let freq = 1.0 / ((pkt.frequency_mhz as f64) * 1_000_000.0);
-            p.set_prediction_error((pkt.prediction_error as f64) * freq);
-            p.set_pps_width((pkt.width as f64) * freq);
-            p.set_output_errors(pkt.output_errors);
+        if let Some(client) = pps_divider_client {
+            self.pps_divider_status(client, &mut proto).await?;
         }
 
         let shared = self.shared.clone();
@@ -484,6 +612,41 @@ impl MocapCamera {
         });
 
         Ok(proto)
+    }
+
+    async fn pps_divider_status(&self, client: &PPSDividerClient, proto: &mut MocapCameraStatus) -> Result<()> {
+        if let Some((pkt, time)) = client.last_heartbeat().await? {
+            let now = Instant::now();
+
+            let p = proto.pps_divider_heartbeat_mut();
+            p.set_mcu_temperature(pkt.temp_c);
+            p.set_vcc_voltage_min(pkt.vcc_min_v);
+            p.set_vcc_voltage_max(pkt.vcc_max_v);
+
+            fn get_poe_voltage(v: f32) -> f32 {
+                electronics::undivide_voltage(
+                    v,
+                    24.9,
+                    1.0
+                )
+            }
+
+            p.set_poe_voltage_min(get_poe_voltage(pkt.poe_min_v));
+            p.set_poe_voltage_max(get_poe_voltage(pkt.poe_max_v));
+        }
+
+        if let Some((pkt, time)) = client.last_telemetry().await? {
+
+            let p = proto.pps_divider_telemetry_mut();
+            p.set_locked(client.is_locked().await?);
+
+            let freq = 1.0 / ((pkt.frequency_mhz as f64) * 1_000_000.0);
+            p.set_prediction_error((pkt.prediction_error as f64) * freq);
+            p.set_pps_width((pkt.width as f64) * freq);
+            p.set_output_errors(pkt.output_errors);
+        }
+
+        Ok(())
     }
 
     // TODO: Ensure that this has low prioritization over the network.
@@ -581,8 +744,13 @@ impl CameraService for MocapCamera {
     ) -> Result<()> {
         let shared = self.shared.clone();
         executor::spawn(async move {
+            let client = match &shared.trigger {
+                FrameTrigger::PPSDivider(client) => client,
+                FrameTrigger::PtpPwm(_) => return Err(err_msg("This camera has no MCU")),
+            };
+
             lock_async!(configure_state <= shared.configure_state.lock().await?, {
-                shared.pps_divider_client.flash(request.firmware()).await
+                client.flash(request.firmware()).await
             })
         }).join().await
     }
@@ -597,7 +765,33 @@ mod tests {
     #[test]
     fn validate_config() {
         let mut initial_config = MocapCameraConfigureRequest::default();
-        MocapCamera::validate_config(&mut initial_config).unwrap();
+        MocapCamera::validate_config(&mut initial_config, &SensorDriver::AR0234(AR0234Driver::default())).unwrap();
+    }
+
+    #[test]
+    fn validate_config_uses_the_ov9281_limits() {
+        let sensor = SensorDriver::OV9281(OV9281Driver::new(192e6, 1456.0));
+
+        let mut config = MocapCameraConfigureRequest::default();
+        config.set_frame_rate(200u32);
+        config.set_exposure_micros(5000u32);
+        MocapCamera::validate_config(&mut config, &sensor).unwrap();
+        assert_eq!(config.frame_rate(), 120);
+        // At 120 fps the readout leaves 1.888 ms for exposure.
+        assert_eq!(config.exposure_micros(), 1888);
+
+        config.set_frame_rate(60u32);
+        config.set_exposure_micros(5000u32);
+        MocapCamera::validate_config(&mut config, &sensor).unwrap();
+        assert_eq!(config.exposure_micros(), 5000);
+
+        // The AR0234 keeps the upstream limits.
+        let mut config = MocapCameraConfigureRequest::default();
+        config.set_frame_rate(200u32);
+        config.set_exposure_micros(5000u32);
+        MocapCamera::validate_config(&mut config, &SensorDriver::AR0234(AR0234Driver::default())).unwrap();
+        assert_eq!(config.frame_rate(), 119);
+        assert_eq!(config.exposure_micros(), 5000);
     }
 
 }
